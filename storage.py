@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,8 @@ class Store:
             raise SystemExit(f"{self.path} is corrupted ({exc}). Fix or delete it, then restart.") from exc
 
     def get(self, guild_id: int) -> dict:
-        return dict(self._data.get(str(guild_id), {}))
+        # A deep copy, so a caller's edits only count once passed to update().
+        return copy.deepcopy(self._data.get(str(guild_id), {}))
 
     def update(self, guild_id: int, **changes) -> None:
         """Set the given values. A value of None removes that setting."""

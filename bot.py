@@ -17,12 +17,14 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
+import customgame
 import storage
 import twitch
 
 log = logging.getLogger("mikasa")
 
 POLL_SECONDS = 60
+VOTE_TIMER_CHECK_SECONDS = 5
 DATA_FILE = Path(__file__).resolve().parent / "data.json"
 DEFAULT_WELCOME = "Welcome to {server}, {member}! 🎮"
 
@@ -38,6 +40,7 @@ CLEARABLE = {
     "ping role": ("ping_role_id",),
     "twitch": ("twitch_username", "stream_id", "last_seen"),
     "tiktok": ("tiktok_username",),
+    "maps": ("maps",),
 }
 
 
@@ -171,10 +174,21 @@ async def setup_tiktok(interaction: discord.Interaction, username: str):
     await reply(interaction, f"✅ Announcements will link https://www.tiktok.com/@{handle}/live.")
 
 
+@setup_group.command(name="maps", description="Set the maps custom games vote on")
+@app_commands.describe(maps="Map names separated by commas, like: Bind, Haven, Lotus")
+async def setup_maps(interaction: discord.Interaction, maps: str):
+    parsed, problem = customgame.parse_maps(maps)
+    if problem:
+        await reply(interaction, problem)
+        return
+    interaction.client.store.update(interaction.guild_id, maps=parsed)
+    await reply(interaction, f"✅ Custom games will vote on: {', '.join(parsed)}.")
+
+
 @setup_group.command(name="clear", description="Turn off or remove one setting")
 async def setup_clear(
     interaction: discord.Interaction,
-    setting: Literal["join role", "welcome", "livenotif", "ping role", "twitch", "tiktok"],
+    setting: Literal["join role", "welcome", "livenotif", "ping role", "twitch", "tiktok", "maps"],
 ):
     interaction.client.store.update(interaction.guild_id, **{key: None for key in CLEARABLE[setting]})
     await reply(interaction, f"✅ Cleared **{setting}**.")
@@ -198,6 +212,7 @@ async def setup_show(interaction: discord.Interaction):
                 f"**Ping role:** {mention('ping_role_id', '@&')}",
                 f"**Twitch:** {settings.get('twitch_username', 'not set')}",
                 f"**TikTok:** {settings.get('tiktok_username', 'not set')}",
+                f"**Custom game maps:** {', '.join(settings.get('maps', customgame.DEFAULT_MAPS))}",
             ]
         ),
     )
@@ -213,6 +228,10 @@ class MikasaBot(discord.Client):
         self.twitch_client_secret = twitch_client_secret
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(setup_group)
+        self.tree.add_command(customgame.customgame_command)
+        self.tree.add_command(customgame.leaderboard_command)
+        # Registered up front so buttons on existing games still work after a restart.
+        self.add_dynamic_items(customgame.GameButton, customgame.TeamSelect)
         self.session: aiohttp.ClientSession | None = None
         self.twitch: twitch.TwitchClient | None = None
 
@@ -221,9 +240,11 @@ class MikasaBot(discord.Client):
         self.twitch = twitch.TwitchClient(self.session, self.twitch_client_id, self.twitch_client_secret)
         await self.tree.sync()
         self.check_twitch.start()
+        self.check_vote_timers.start()
 
     async def close(self) -> None:
         self.check_twitch.cancel()
+        self.check_vote_timers.cancel()
         if self.session:
             await self.session.close()
         await super().close()
@@ -312,6 +333,18 @@ class MikasaBot(discord.Client):
 
     @check_twitch.before_loop
     async def _wait_until_ready(self) -> None:
+        await self.wait_until_ready()
+
+    @tasks.loop(seconds=VOTE_TIMER_CHECK_SECONDS)
+    async def check_vote_timers(self) -> None:
+        # An unhandled error would stop the loop for good, so log and try again.
+        try:
+            await customgame.expire_votes(self, time.time())
+        except Exception:
+            log.exception("Vote timer check failed")
+
+    @check_vote_timers.before_loop
+    async def _wait_until_ready_for_votes(self) -> None:
         await self.wait_until_ready()
 
 
