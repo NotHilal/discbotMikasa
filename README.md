@@ -38,6 +38,7 @@ python bot.py
 | `/setup pingrole <role>` | The role announcements ping |
 | `/setup twitch <username>` | The Twitch channel to watch |
 | `/setup tiktok <username>` | The TikTok account to link |
+| `/setup testlive [ping]` | Posts a labelled test announcement. It only pings the ping role if you set `ping` to true. |
 | `/setup maps <maps>` | The custom game maps, separated by commas |
 | `/setup clear <setting>` | Turns off or removes one setting |
 | `/setup show` | Shows this server's current settings |

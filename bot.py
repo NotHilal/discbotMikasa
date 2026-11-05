@@ -175,6 +175,32 @@ async def setup_tiktok(interaction: discord.Interaction, username: str):
     await reply(interaction, f"✅ Announcements will link https://www.tiktok.com/@{handle}/live.")
 
 
+@setup_group.command(name="testlive", description="Post a test live announcement in the live notification channel")
+@app_commands.describe(ping="Also ping the ping role (off by default)")
+async def setup_testlive(interaction: discord.Interaction, ping: bool = False):
+    settings = interaction.client.store.get(interaction.guild_id)
+    missing = [
+        command
+        for key, command in (("announce_channel_id", "/setup livenotif"), ("twitch_username", "/setup twitch"))
+        if not settings.get(key)
+    ]
+    if missing:
+        await reply(interaction, f"❌ Set this up first: {', '.join(missing)}")
+        return
+
+    if not ping:
+        settings.pop("ping_role_id", None)
+    text = "🧪 **This is a test, not a real stream.**\n" + build_announcement(settings, interaction.guild)
+    try:
+        channel = await interaction.client._get_channel(settings["announce_channel_id"])
+        await channel.send(text, allowed_mentions=discord.AllowedMentions(everyone=False, roles=ping, users=False))
+    except discord.HTTPException:
+        log.exception("Test announcement failed in %s", interaction.guild)
+        await reply(interaction, "❌ I couldn't post in the live notification channel. Check my permissions there.")
+        return
+    await reply(interaction, f"✅ Test posted in <#{settings['announce_channel_id']}>.")
+
+
 @setup_group.command(name="maps", description="Set the maps custom games vote on")
 @app_commands.describe(maps="Map names separated by commas, like: Bind, Haven, Lotus")
 async def setup_maps(interaction: discord.Interaction, maps: str):

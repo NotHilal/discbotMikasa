@@ -336,6 +336,49 @@ class CommandTests(BotCase):
         await bot.setup_clear.callback(self.interaction(), "twitch")
         self.assertEqual(self.store.get(1), {"tiktok_username": "tok"})
 
+    def live_interaction(self):
+        self.store.update(1, announce_channel_id=3, twitch_username="me", tiktok_username="tok", ping_role_id=5)
+        interaction = self.interaction()
+        interaction.guild.get_role.return_value = MagicMock(mention="<@&5>")
+        return interaction
+
+    async def test_testlive_posts_a_labelled_announcement_without_pinging(self):
+        await bot.setup_testlive.callback(self.live_interaction())
+        self.bot._get_channel.assert_awaited_once_with(3)
+        text = self.channel.send.await_args.args[0]
+        self.assertTrue(text.startswith("🧪"))
+        self.assertIn("https://twitch.tv/me", text)
+        self.assertIn("https://www.tiktok.com/@tok/live", text)
+        self.assertNotIn("<@&5>", text)
+        self.assertFalse(self.channel.send.await_args.kwargs["allowed_mentions"].roles)
+
+    async def test_testlive_can_ping_when_asked(self):
+        await bot.setup_testlive.callback(self.live_interaction(), ping=True)
+        self.assertIn("<@&5>", self.channel.send.await_args.args[0])
+        self.assertTrue(self.channel.send.await_args.kwargs["allowed_mentions"].roles)
+
+    async def test_testlive_does_not_block_the_real_announcement(self):
+        await bot.setup_testlive.callback(self.live_interaction())
+        settings = self.store.get(1)
+        self.assertNotIn("stream_id", settings)
+        self.assertNotIn("last_seen", settings)
+        self.assertEqual(settings["ping_role_id"], 5)
+
+    async def test_testlive_needs_the_channel_and_twitch(self):
+        interaction = self.interaction()
+        await bot.setup_testlive.callback(interaction)
+        message = interaction.response.send_message.await_args.args[0]
+        self.assertIn("/setup livenotif", message)
+        self.assertIn("/setup twitch", message)
+        self.channel.send.assert_not_awaited()
+
+    async def test_testlive_reports_a_failed_post(self):
+        interaction = self.live_interaction()
+        self.channel.send.side_effect = discord.Forbidden(MagicMock(status=403, reason="no"), "no")
+        with self.assertLogs("mikasa", "ERROR"):
+            await bot.setup_testlive.callback(interaction)
+        self.assertIn("couldn't post", interaction.response.send_message.await_args.args[0])
+
     async def test_show_lists_settings_and_defaults(self):
         self.store.update(1, twitch_username="me", ping_role_id=7)
         interaction = self.interaction()
