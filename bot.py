@@ -90,7 +90,8 @@ def join_role_problem(role: discord.Role, interaction: discord.Interaction) -> s
 
 
 async def reply(interaction: discord.Interaction, message: str) -> None:
-    await interaction.response.send_message(message, ephemeral=True)
+    # Public, so no mentions: confirming a ping role mustn't actually ping it.
+    await interaction.response.send_message(message, allowed_mentions=discord.AllowedMentions.none())
 
 
 setup_group = app_commands.Group(

@@ -259,7 +259,15 @@ class CommandTests(BotCase):
         interaction = self.interaction()
         await bot.setup_joinrole.callback(interaction, self.role())
         self.assertEqual(self.store.get(1)["join_role_id"], 7)
-        self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
+
+    async def test_setup_replies_are_public_and_never_ping(self):
+        interaction = self.interaction()
+        await bot.setup_pingrole.callback(interaction, self.role())
+        kwargs = interaction.response.send_message.await_args.kwargs
+        self.assertNotIn("ephemeral", kwargs)
+        self.assertFalse(kwargs["allowed_mentions"].roles)
+        self.assertFalse(kwargs["allowed_mentions"].everyone)
+        self.assertFalse(kwargs["allowed_mentions"].users)
 
     async def test_joinrole_rejects_unusable_roles(self):
         for role, expected in (

@@ -28,7 +28,7 @@ python bot.py
 
 1. Invite the bot with the `bot` and `applications.commands` scopes and these permissions: View Channels, Send Messages, Manage Roles.
 2. In **Server Settings > Roles**, drag the bot's role **above** the role it should assign.
-3. Run the commands below. They need Manage Server, and only the person running them sees the replies.
+3. Run the commands below. They need Manage Server, and everyone in the channel can see the replies, so run them in a staff channel to keep your settings private.
 
 | Command | What it sets |
 |---|---|
