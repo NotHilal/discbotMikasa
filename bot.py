@@ -258,7 +258,9 @@ class MikasaBot(discord.Client):
         self.tree.add_command(customgame.customgame_command)
         self.tree.add_command(customgame.leaderboard_command)
         # Registered up front so buttons on existing games still work after a restart.
-        self.add_dynamic_items(customgame.GameButton, customgame.TeamSelect)
+        self.add_dynamic_items(
+            customgame.GameButton, customgame.TeamSelect, customgame.BallotSelect, customgame.ConfirmVote
+        )
         self.session: aiohttp.ClientSession | None = None
         self.twitch: twitch.TwitchClient | None = None
 

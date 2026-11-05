@@ -200,68 +200,151 @@ class TeamTests(CustomGameCase):
 class VoteTests(CustomGameCase):
     def setUp(self):
         super().setUp()
-        self.save_game(phase="vote", maps=["A", "B", "C"], votes={}, vote_ends_at=time.time() + 100, channel_id=77)
+        self.save_game(
+            phase="vote",
+            maps=["A", "B", "C"],
+            votes={},
+            picks={},
+            vote_ends_at=time.time() + 100,
+            channel_id=77,
+        )
+        self.edit = AsyncMock()
+        self.client.get_partial_messageable.return_value.get_partial_message.return_value.edit = self.edit
+        self.game_id = str(self.MESSAGE_ID)
 
-    async def test_player_votes_without_being_an_admin(self):
+    async def vote(self, user_id, *picks):
+        await customgame.handle_ballot_select(
+            self.interaction(user_id=user_id, admin=False), self.game_id, [str(pick) for pick in picks]
+        )
+        interaction = self.interaction(user_id=user_id, admin=False)
+        await customgame.handle_confirm_vote(interaction, self.game_id)
+        return interaction
+
+    async def test_vote_button_opens_a_private_ballot(self):
         interaction = self.interaction(user_id=1, admin=False)
-        await customgame.handle_button(interaction, "vote", "1")
-        self.assertEqual(self.game()["votes"], {"1": [1]})
-        self.assertEqual(interaction.followup.send.await_args.args[0], "Your votes: B")
-        self.assertTrue(interaction.followup.send.await_args.kwargs["ephemeral"])
+        await customgame.handle_button(interaction, "ballot", None)
+        call = interaction.response.send_message.await_args
+        self.assertTrue(call.kwargs["ephemeral"])
+        ids = [item.custom_id for item in call.kwargs["view"].children]
+        self.assertEqual(ids, [f"mikasa:ballot:{self.game_id}", f"mikasa:confirm:{self.game_id}"])
+        self.assertTrue(call.kwargs["view"].children[1].item.disabled)
 
-    async def test_player_gets_two_votes(self):
-        await customgame.handle_button(self.interaction(user_id=1), "vote", "0")
-        await customgame.handle_button(self.interaction(user_id=1), "vote", "1")
-        self.assertEqual(self.game()["votes"], {"1": [0, 1]})
-
-    async def test_third_vote_is_refused(self):
-        await customgame.handle_button(self.interaction(user_id=1), "vote", "0")
-        await customgame.handle_button(self.interaction(user_id=1), "vote", "1")
-        interaction = self.interaction(user_id=1)
-        await customgame.handle_button(interaction, "vote", "2")
-        self.assertIn("used all your votes", self.denial(interaction))
-        self.assertEqual(self.game()["votes"], {"1": [0, 1]})
-
-    async def test_clicking_a_map_again_removes_the_vote(self):
-        await customgame.handle_button(self.interaction(user_id=1), "vote", "0")
-        await customgame.handle_button(self.interaction(user_id=1), "vote", "0")
-        self.assertEqual(self.game()["votes"], {})
-
-    async def test_two_maps_allow_one_vote_each(self):
-        self.save_game(phase="vote", maps=["A", "B"], votes={}, vote_ends_at=time.time() + 100)
-        await customgame.handle_button(self.interaction(user_id=1), "vote", "0")
-        interaction = self.interaction(user_id=1)
-        await customgame.handle_button(interaction, "vote", "1")
-        self.assertIn("used all your votes", self.denial(interaction))
-
-    async def test_non_players_cannot_vote_even_if_admin(self):
+    async def test_non_players_get_no_ballot_even_if_admin(self):
         interaction = self.interaction(user_id=100, admin=True)
-        await customgame.handle_button(interaction, "vote", "0")
+        await customgame.handle_button(interaction, "ballot", None)
         self.assertIn("Only the players", self.denial(interaction))
+
+    async def test_non_players_cannot_use_a_ballot(self):
+        interaction = self.interaction(user_id=100)
+        await customgame.handle_ballot_select(interaction, self.game_id, ["0"])
+        self.assertIn("Only the players", self.denial(interaction))
+        self.assertEqual(self.game()["picks"], {})
+
+    async def test_picks_do_not_count_until_confirmed(self):
+        await customgame.handle_ballot_select(self.interaction(user_id=1), self.game_id, ["0", "1"])
+        self.assertEqual(self.game()["votes"], {})
+        self.assertEqual(self.game()["picks"], {"1": [0, 1]})
+
+    async def test_confirm_records_the_vote_and_updates_the_panel(self):
+        interaction = await self.vote(1, 0, 1)
+        self.assertEqual(self.game()["votes"], {"1": [0, 1]})
+        self.assertEqual(self.game()["picks"], {})
+        self.assertIn("A, B", interaction.response.edit_message.await_args.kwargs["content"])
+        self.assertIsNone(interaction.response.edit_message.await_args.kwargs["view"])
+        self.assertIn("1/4 confirmed", self.edit.await_args.kwargs["embed"].title)
+
+    async def test_one_vote_is_allowed(self):
+        await self.vote(1, 2)
+        self.assertEqual(self.game()["votes"], {"1": [2]})
+
+    async def test_confirm_needs_a_pick(self):
+        interaction = self.interaction(user_id=1)
+        await customgame.handle_confirm_vote(interaction, self.game_id)
+        self.assertIn("Pick at least one", self.denial(interaction))
         self.assertEqual(self.game()["votes"], {})
 
-    async def test_vote_ends_when_everyone_has_used_both_votes(self):
-        for user_id in (1, 2, 3):
-            await customgame.handle_button(self.interaction(user_id=user_id), "vote", "1")
-            await customgame.handle_button(self.interaction(user_id=user_id), "vote", "0")
-        await customgame.handle_button(self.interaction(user_id=4), "vote", "1")
+    async def test_player_can_change_a_confirmed_vote(self):
+        await self.vote(1, 0)
+        await self.vote(1, 1, 2)
+        self.assertEqual(self.game()["votes"], {"1": [1, 2]})
+
+    async def test_ballot_shows_existing_vote_and_can_reconfirm_it(self):
+        await self.vote(1, 0)
+        _, view = customgame.render_ballot(self.game(), self.game_id, 1)
+        options = view.children[0].item.options
+        self.assertEqual([option.default for option in options], [True, False, False])
+        self.assertFalse(view.children[1].item.disabled)
+        await customgame.handle_confirm_vote(self.interaction(user_id=1), self.game_id)
+        self.assertEqual(self.game()["votes"], {"1": [0]})
+
+    def test_ballot_limits_the_number_of_picks(self):
+        _, view = customgame.render_ballot(self.game(), self.game_id, 1)
+        self.assertEqual(view.children[0].item.max_values, 2)
+        self.save_game(phase="vote", maps=["A", "B"], votes={}, vote_ends_at=1000)
+        _, view = customgame.render_ballot(self.game(), self.game_id, 1)
+        self.assertEqual(view.children[0].item.max_values, 1)
+
+    async def test_panel_hides_totals_and_choices_during_the_vote(self):
+        await self.vote(1, 2)
+        embed, _ = customgame.render(self.game())
+        self.assertNotIn("Votes", [field.name for field in embed.fields])
+        text = str(embed.to_dict())
+        self.assertNotIn("**1**", text)
+        waiting = next(field.value for field in embed.fields if field.name == "Waiting on")
+        self.assertNotIn("<@1>", waiting)
+        self.assertIn("<@2>", waiting)
+
+    async def test_vote_ends_when_everyone_has_confirmed(self):
+        await self.vote(1, 1)
+        await self.vote(2, 1, 0)
+        await self.vote(3, 1)
         self.assertEqual(self.game()["phase"], "vote")
-        await customgame.handle_button(self.interaction(user_id=4), "vote", "2")
+        last = await self.vote(4, 0)
         self.assertEqual(self.game()["phase"], "playing")
         self.assertEqual(self.game()["map"], "B")
+        self.assertNotIn("again", last.response.edit_message.await_args.kwargs["content"])
+
+    async def test_totals_are_revealed_when_voting_ends(self):
+        await self.vote(1, 1)
+        await self.vote(2, 1, 0)
+        await customgame.handle_button(self.interaction(), "endvote", None)
+        embed, _ = customgame.render(self.game())
+        votes = next(field.value for field in embed.fields if field.name == "Votes")
+        self.assertEqual(votes.split("\n"), ["B: **2**", "A: **1**"])
+
+    async def test_unconfirmed_picks_are_ignored_at_the_end(self):
+        await customgame.handle_ballot_select(self.interaction(user_id=1), self.game_id, ["0"])
+        await self.vote(2, 2)
+        await customgame.handle_button(self.interaction(), "endvote", None)
+        self.assertEqual(self.game()["map"], "C")
+        self.assertNotIn("picks", self.game())
+
+    async def test_ballot_used_after_voting_closed_says_so(self):
+        await customgame.handle_ballot_select(self.interaction(user_id=1), self.game_id, ["0"])
+        await customgame.handle_button(self.interaction(), "endvote", None)
+        interaction = self.interaction(user_id=1)
+        await customgame.handle_confirm_vote(interaction, self.game_id)
+        self.assertIn("closed", interaction.response.edit_message.await_args.kwargs["content"])
+        self.assertEqual(self.game()["votes"], {})
+
+    async def test_ballot_used_after_cancel_says_so(self):
+        await customgame.handle_button(self.interaction(), "cancel", None)
+        interaction = self.interaction(user_id=1)
+        await customgame.handle_ballot_select(interaction, self.game_id, ["0"])
+        self.assertIn("closed", interaction.response.edit_message.await_args.kwargs["content"])
 
     async def test_click_after_the_vote_closed_refreshes_the_message(self):
         self.save_game(phase="playing", map="A", maps=["A", "B", "C"], votes={})
         interaction = self.interaction(user_id=1, admin=False)
-        await customgame.handle_button(interaction, "vote", "1")
-        self.assertEqual(self.game()["votes"], {})
+        await customgame.handle_button(interaction, "ballot", None)
         self.assertIn("Map: A", interaction.response.edit_message.await_args.kwargs["embed"].title)
 
     async def test_admin_can_end_the_vote_early(self):
-        await customgame.handle_button(self.interaction(user_id=1), "vote", "0")
+        await self.vote(1, 0)
         await customgame.handle_button(self.interaction(), "endvote", None)
         self.assertEqual(self.game()["phase"], "playing")
         self.assertEqual(self.game()["map"], "A")
+        self.assertIsNone(self.game().get("map_note"))
 
     async def test_player_cannot_end_the_vote(self):
         interaction = self.interaction(user_id=1, admin=False)
@@ -374,12 +457,15 @@ class RestartTests(CustomGameCase):
     """Runs clicks through discord.py's real dispatcher with a fresh view store, as
     after a restart: nothing is in memory except the registered dynamic item types."""
 
-    async def click(self, game, custom_id, component_type, item_type, data=None, **interaction_args):
+    async def click(self, game, custom_id, component_type, item_type, data=None, view=None, **interaction_args):
         client = bot.MikasaBot(self.store, "id", "secret")
         store = ViewStore(client._connection)
-        store.add_dynamic_items(customgame.GameButton, customgame.TeamSelect)
+        store.add_dynamic_items(
+            customgame.GameButton, customgame.TeamSelect, customgame.BallotSelect, customgame.ConfirmVote
+        )
 
-        _, view = customgame.render(game)
+        if view is None:
+            _, view = customgame.render(game)
         interaction = self.interaction(**interaction_args)
         interaction.client = client
         interaction._state = client._connection
@@ -396,8 +482,34 @@ class RestartTests(CustomGameCase):
 
     async def test_vote_button_works_after_restart(self):
         self.save_game(phase="vote", maps=["A", "B", "C"], votes={}, vote_ends_at=time.time() + 100)
-        await self.click(self.game(), "mikasa:game:vote:1", 2, customgame.GameButton, user_id=1, admin=False)
+        game_id = str(self.MESSAGE_ID)
+        _, ballot = customgame.render_ballot(self.game(), game_id, 1)
+        await self.click(
+            self.game(),
+            f"mikasa:ballot:{game_id}",
+            3,
+            customgame.BallotSelect,
+            data={"values": ["1"]},
+            view=ballot,
+            user_id=1,
+            admin=False,
+        )
+        self.assertEqual(self.game()["picks"], {"1": [1]})
+
+        self.client.get_partial_messageable.return_value.get_partial_message.return_value.edit = AsyncMock()
+        _, ballot = customgame.render_ballot(self.game(), game_id, 1)
+        interaction = await self.click(
+            self.game(), f"mikasa:confirm:{game_id}", 2, customgame.ConfirmVote, view=ballot, user_id=1, admin=False
+        )
         self.assertEqual(self.game()["votes"], {"1": [1]})
+        interaction.response.edit_message.assert_awaited_once()
+
+    async def test_vote_panel_button_works_after_restart(self):
+        self.save_game(phase="vote", maps=["A", "B", "C"], votes={}, vote_ends_at=time.time() + 100)
+        interaction = await self.click(
+            self.game(), "mikasa:game:ballot", 2, customgame.GameButton, user_id=1, admin=False
+        )
+        self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
 
     async def test_result_button_works_after_restart(self):
         self.save_game(phase="playing", map="Bind")

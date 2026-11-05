@@ -52,7 +52,7 @@ Settings, games in progress and leaderboards are saved in `data.json`. Back it u
 An admin (anyone with Manage Server) runs `/customgame`, and one message then moves through each step:
 
 1. **Teams:** the admin picks up to 5 players per team from the dropdowns. Each team needs at least one player. Picking someone already on the other team moves them.
-2. **Map vote:** only the players can vote. Each gets 2 votes, and clicking a map again removes that vote. The vote ends after 2 minutes, when everyone has used both votes, or when an admin clicks **End vote**. Ties are picked at random.
+2. **Map vote:** players click **Vote**, pick up to 2 maps on a private ballot and click **Confirm vote**. Picks that aren't confirmed don't count, and a player can vote again to change their choice. The totals stay hidden until voting ends, which happens after 2 minutes, when everyone has confirmed, or when an admin clicks **End vote**. Ties are picked at random.
 3. **Playing:** everyone starts the game in VALORANT, then an admin clicks the team that won.
 4. **Result:** wins and losses are added to the leaderboard. An admin can click **Undo result** to fix a misclick.
 

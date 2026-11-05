@@ -45,7 +45,7 @@ TEAM_NAMES = {"a": "Team A", "b": "Team B"}
 ACTION_PHASES = {
     "start": {"teams"},
     "cancel": {"teams", "vote", "playing"},
-    "vote": {"vote"},
+    "ballot": {"vote"},
     "endvote": {"vote"},
     "won": {"playing"},
     "undo": {"finished"},
@@ -109,6 +109,8 @@ def apply_result(leaderboard: dict, game: dict, change: int) -> None:
 
 
 def finish_vote(game: dict) -> None:
+    # Only confirmed votes count; unconfirmed picks are thrown away.
+    game.pop("picks", None)
     game["map"], game["map_note"] = pick_map(game["maps"], game["votes"])
     game["phase"] = "playing"
 
@@ -122,6 +124,19 @@ def _base_embed(title: str, game: dict, color: discord.Color) -> discord.Embed:
     embed.add_field(name=TEAM_NAMES["a"], value=_team_text(game, "a"))
     embed.add_field(name=TEAM_NAMES["b"], value=_team_text(game, "b"))
     return embed
+
+
+def _add_vote_results(embed: discord.Embed, game: dict) -> None:
+    """Reveals the totals, which stay hidden until voting has ended."""
+    if not game.get("votes"):
+        return
+    counts = count_votes(game["maps"], game["votes"])
+    ranked = sorted(zip(game["maps"], counts), key=lambda pair: -pair[1])
+    embed.add_field(
+        name="Votes",
+        value="\n".join(f"{name}: **{count}**" for name, count in ranked if count),
+        inline=False,
+    )
 
 
 def _button(
@@ -164,30 +179,27 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
 
     elif phase == "vote":
         votes = game["votes"]
-        allowed = votes_allowed(game)
-        waiting = [user_id for user_id in players(game) if len(votes.get(str(user_id), [])) < allowed]
-        finished = len(players(game)) - len(waiting)
-        embed = _base_embed(f"🗺️ Vote for a map ({finished}/{len(players(game))} done)", game, discord.Color.gold())
+        waiting = [user_id for user_id in players(game) if str(user_id) not in votes]
+        confirmed = len(players(game)) - len(waiting)
+        embed = _base_embed(
+            f"🗺️ Vote for a map ({confirmed}/{len(players(game))} confirmed)", game, discord.Color.gold()
+        )
         embed.description = (
-            f"Pick up to {allowed} maps, and click a map again to remove your vote.\n"
+            f"Click **Vote** to pick up to {votes_allowed(game)} maps, then confirm. "
+            "The votes stay hidden until voting ends.\n"
             f"Voting ends <t:{int(game['vote_ends_at'])}:R>."
         )
-        counts = count_votes(game["maps"], votes)
-        embed.add_field(
-            name="Votes",
-            value="\n".join(f"{name}: **{count}**" for name, count in zip(game["maps"], counts)),
-            inline=False,
-        )
+        embed.add_field(name="Maps", value=", ".join(game["maps"]), inline=False)
         embed.add_field(name="Waiting on", value=" ".join(f"<@{user_id}>" for user_id in waiting), inline=False)
-        for index, name in enumerate(game["maps"]):
-            view.add_item(_button("vote", name, discord.ButtonStyle.primary, arg=str(index), row=index // 5))
-        view.add_item(_button("endvote", "End vote", discord.ButtonStyle.success, row=4))
-        view.add_item(_button("cancel", "Cancel game", discord.ButtonStyle.secondary, row=4))
+        view.add_item(_button("ballot", "Vote", discord.ButtonStyle.primary))
+        view.add_item(_button("endvote", "End vote", discord.ButtonStyle.success))
+        view.add_item(_button("cancel", "Cancel game", discord.ButtonStyle.secondary))
 
     elif phase == "playing":
         embed = _base_embed(f"⚔️ Map: {game['map']}", game, discord.Color.red())
         if game.get("map_note"):
             embed.description = game["map_note"]
+        _add_vote_results(embed, game)
         view.add_item(_button("won", "Team A won", discord.ButtonStyle.success, arg="a"))
         view.add_item(_button("won", "Team B won", discord.ButtonStyle.success, arg="b"))
         view.add_item(_button("cancel", "Cancel game", discord.ButtonStyle.secondary))
@@ -195,6 +207,7 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
     else:  # finished
         title = f"🏆 {TEAM_NAMES[game['winner']]} won on {game['map']}!"
         embed = _base_embed(title, game, discord.Color.green())
+        _add_vote_results(embed, game)
         view.add_item(_button("undo", "Undo result", discord.ButtonStyle.secondary))
 
     return embed, view
@@ -236,7 +249,7 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
     if game is None:
         await _deny(interaction, "❌ This game no longer exists.")
         return
-    if action != "vote" and not is_admin(interaction):
+    if action != "ballot" and not is_admin(interaction):
         await _deny(interaction, "❌ Only admins can do that.")
         return
     if game["phase"] not in ACTION_PHASES[action]:
@@ -247,33 +260,12 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
 
     leaderboard = settings.get("leaderboard", {})
 
-    if action == "vote":
+    if action == "ballot":
         if interaction.user.id not in players(game):
             await _deny(interaction, "❌ Only the players in this game can vote.")
             return
-        index = int(arg)
-        choices = game["votes"].get(str(interaction.user.id), [])
-        if index in choices:
-            choices.remove(index)
-        elif len(choices) >= votes_allowed(game):
-            await _deny(interaction, "❌ You've used all your votes. Click one of your maps to remove it first.")
-            return
-        else:
-            choices.append(index)
-        if choices:
-            game["votes"][str(interaction.user.id)] = choices
-        else:
-            del game["votes"][str(interaction.user.id)]
-
-        allowed = votes_allowed(game)
-        if all(len(game["votes"].get(str(user_id), [])) >= allowed for user_id in players(game)):
-            finish_vote(game)
-        store.update(interaction.guild_id, games=games)
-        embed, view = render(game)
-        await interaction.response.edit_message(embed=embed, view=view)
-        # The buttons look the same for everyone, so tell each player what they picked.
-        names = ", ".join(game["maps"][i] for i in choices) or "none"
-        await interaction.followup.send(f"Your votes: {names}", ephemeral=True)
+        text, view = render_ballot(game, key, interaction.user.id)
+        await interaction.response.send_message(text, view=view, ephemeral=True)
         return
     elif action == "start":
         if not (game["team_a"] and game["team_b"]):
@@ -281,6 +273,7 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
             return
         game["maps"] = settings.get("maps", DEFAULT_MAPS)
         game["votes"] = {}
+        game["picks"] = {}
         game["vote_ends_at"] = time.time() + VOTE_SECONDS
         game["phase"] = "vote"
     elif action == "endvote":
@@ -306,6 +299,101 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
     await interaction.response.edit_message(embed=embed, view=view)
 
 
+async def _update_game_message(client: discord.Client, game_id: str, game: dict) -> None:
+    embed, view = render(game)
+    message = client.get_partial_messageable(game["channel_id"]).get_partial_message(int(game_id))
+    # The game is already saved, and clicking the old message refreshes it.
+    try:
+        await message.edit(embed=embed, view=view)
+    except discord.HTTPException:
+        log.exception("Couldn't update the custom game message %s", game_id)
+
+
+def render_ballot(game: dict, game_id: str, user_id: int) -> tuple[str, discord.ui.View]:
+    """A player's private ballot, showing their unconfirmed picks or current vote."""
+    uid = str(user_id)
+    picks = game.get("picks", {}).get(uid, game["votes"].get(uid, []))
+    allowed = votes_allowed(game)
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        BallotSelect(
+            discord.ui.Select(
+                custom_id=f"mikasa:ballot:{game_id}",
+                placeholder=f"Pick up to {allowed} maps",
+                min_values=1,
+                max_values=allowed,
+                options=[
+                    discord.SelectOption(label=name, value=str(index), default=index in picks)
+                    for index, name in enumerate(game["maps"])
+                ],
+                row=0,
+            )
+        )
+    )
+    view.add_item(
+        ConfirmVote(
+            discord.ui.Button(
+                label="Confirm vote",
+                style=discord.ButtonStyle.success,
+                custom_id=f"mikasa:confirm:{game_id}",
+                disabled=not picks,
+                row=1,
+            )
+        )
+    )
+    text = (
+        f"Pick up to {allowed} maps, then click **Confirm vote**. Picks you don't confirm won't count.\n"
+        f"Voting ends <t:{int(game['vote_ends_at'])}:R>."
+    )
+    return text, view
+
+
+async def _open_ballot_game(interaction: discord.Interaction, game_id: str) -> tuple[dict | None, dict | None]:
+    """The games and this game, if the user can still vote in it. Otherwise says why."""
+    games = interaction.client.store.get(interaction.guild_id).get("games", {})
+    game = games.get(game_id)
+    if game is None or game["phase"] != "vote":
+        await interaction.response.edit_message(content="🗳️ Voting has closed.", view=None)
+        return None, None
+    if interaction.user.id not in players(game):
+        await _deny(interaction, "❌ Only the players in this game can vote.")
+        return None, None
+    return games, game
+
+
+async def handle_ballot_select(interaction: discord.Interaction, game_id: str, values: list[str]) -> None:
+    games, game = await _open_ballot_game(interaction, game_id)
+    if game is None:
+        return
+    game.setdefault("picks", {})[str(interaction.user.id)] = [int(value) for value in values]
+    interaction.client.store.update(interaction.guild_id, games=games)
+    text, view = render_ballot(game, game_id, interaction.user.id)
+    await interaction.response.edit_message(content=text, view=view)
+
+
+async def handle_confirm_vote(interaction: discord.Interaction, game_id: str) -> None:
+    games, game = await _open_ballot_game(interaction, game_id)
+    if game is None:
+        return
+    uid = str(interaction.user.id)
+    picks = game.get("picks", {}).pop(uid, game["votes"].get(uid, []))
+    if not picks:
+        await _deny(interaction, "❌ Pick at least one map first.")
+        return
+
+    game["votes"][uid] = picks
+    if all(str(user_id) in game["votes"] for user_id in players(game)):
+        finish_vote(game)
+    interaction.client.store.update(interaction.guild_id, games=games)
+
+    names = ", ".join(game["maps"][index] for index in picks)
+    message = f"✅ Your vote is in: **{names}**."
+    if game["phase"] == "vote":
+        message += " Click **Vote** again to change it before voting ends."
+    await interaction.response.edit_message(content=message, view=None)
+    await _update_game_message(interaction.client, game_id, game)
+
+
 async def expire_votes(client: discord.Client, now: float) -> None:
     """Closes every vote whose time has run out. The deadline is saved with the
     game, so a vote that ended while the bot was offline closes when it returns."""
@@ -321,13 +409,7 @@ async def expire_votes(client: discord.Client, now: float) -> None:
         client.store.update(guild.id, games=games)
 
         for key, game in expired:
-            embed, view = render(game)
-            message = client.get_partial_messageable(game["channel_id"]).get_partial_message(int(key))
-            # The result is already saved, and clicking the old message refreshes it.
-            try:
-                await message.edit(embed=embed, view=view)
-            except discord.HTTPException:
-                log.exception("Couldn't update the custom game message %s in %s", key, guild)
+            await _update_game_message(client, key, game)
 
 
 class GameButton(discord.ui.DynamicItem[discord.ui.Button], template=r"mikasa:game:(?P<action>[a-z]+)(?::(?P<arg>[a-z0-9]+))?"):
@@ -343,6 +425,32 @@ class GameButton(discord.ui.DynamicItem[discord.ui.Button], template=r"mikasa:ga
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await handle_button(interaction, self.action, self.arg)
+
+
+class BallotSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"mikasa:ballot:(?P<game>[0-9]+)"):
+    game_id: str
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        select = cls(item)
+        select.game_id = match["game"]
+        return select
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await handle_ballot_select(interaction, self.game_id, self.item.values)
+
+
+class ConfirmVote(discord.ui.DynamicItem[discord.ui.Button], template=r"mikasa:confirm:(?P<game>[0-9]+)"):
+    game_id: str
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        button = cls(item)
+        button.game_id = match["game"]
+        return button
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await handle_confirm_vote(interaction, self.game_id)
 
 
 class TeamSelect(discord.ui.DynamicItem[discord.ui.UserSelect], template=r"mikasa:team:(?P<team>[ab])"):
