@@ -6,6 +6,7 @@ A small Discord bot that:
 - posts a welcome message
 - announces when a Twitch stream goes live, with the Twitch and TikTok links
 - runs VALORANT custom games with team picking, a map vote and a win leaderboard
+- posts reaction role menus, where people react with an emoji to get a role
 
 Only Twitch is checked for live status, about once a minute. The TikTok link is
 just included in the message, so a TikTok-only stream won't trigger an announcement.
@@ -57,6 +58,21 @@ An admin (anyone with Manage Server) runs `/customgame`, and one message then mo
 4. **Result:** wins and losses are added to the leaderboard. An admin can click **Undo result** to fix a misclick.
 
 Anyone can run `/leaderboard` to see the top 20, ranked by wins. Each server has its own leaderboard, and games keep working if the bot restarts.
+
+## Role menus
+
+Admins (anyone with Manage Server) build a menu in the channel it should be posted in, then post it. A channel can hold several menus, each with its own name, like `age`, `ranks` or `notifs`.
+
+| Command | What it does |
+|---|---|
+| `/reactionrole <menu> <emoji> [role] [label] [description]` | Adds an option to a menu, and shows a private preview. Leave `role` empty and give a `label` for an option that gives no role, like "No thanks". |
+| `/removereactionrole <menu> <emoji>` | Removes an option. Removing the last one deletes the menu. |
+| `/displayroleselect <menu> [pick_one] [title] [text] [color]` | Posts the menu and adds its reactions. With `pick_one`, people can only hold one role from it, and picking another swaps it. Running it again reposts the menu and deletes the old message. |
+| `/deleterolemenu <menu>` | Deletes a menu and its message. People keep the roles they already picked. |
+
+Once a menu is posted, adding or removing options updates it in place. A menu holds up to 20 options, Discord's limit on reactions per message.
+
+The bot needs Manage Roles, and its role must be above every role on a menu. In the menu's channel it needs View Channel, Send Messages, Embed Links, Add Reactions and Read Message History, plus Manage Messages for pick-one menus to remove old reactions. Roles with moderator or admin permissions, and roles above your own, can only be added by the server owner.
 
 ## Test
 

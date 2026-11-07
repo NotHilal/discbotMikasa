@@ -18,6 +18,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 import customgame
+import rolemenu
 import storage
 import twitch
 
@@ -257,6 +258,8 @@ class MikasaBot(discord.Client):
         self.tree.add_command(setup_group)
         self.tree.add_command(customgame.customgame_command)
         self.tree.add_command(customgame.leaderboard_command)
+        for command in rolemenu.COMMANDS:
+            self.tree.add_command(command)
         # Registered up front so buttons on existing games still work after a restart.
         self.add_dynamic_items(
             customgame.GameButton, customgame.TeamSelect, customgame.BallotSelect, customgame.ConfirmVote
@@ -290,6 +293,12 @@ class MikasaBot(discord.Client):
             await self._assign_role(member, settings["join_role_id"])
         if settings.get("welcome_channel_id"):
             await self._send_welcome(member, settings)
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        await rolemenu.handle_reaction(self, payload, adding=True)
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        await rolemenu.handle_reaction(self, payload, adding=False)
 
     async def _assign_role(self, member: discord.Member, role_id: int) -> None:
         role = member.guild.get_role(role_id)
