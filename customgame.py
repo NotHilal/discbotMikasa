@@ -421,6 +421,9 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         if interaction.user.id not in players(game):
             await _deny(interaction, "❌ Only the players in this game can vote.")
             return
+        if str(interaction.user.id) in game["votes"]:
+            await _deny(interaction, _already_voted_text(game, interaction.user.id))
+            return
         text, view = render_ballot(game, key, interaction.user.id)
         await interaction.response.send_message(text, view=view, ephemeral=True)
         return
@@ -654,9 +657,8 @@ async def _update_game_message(client: discord.Client, game_id: str, game: dict,
 
 
 def render_ballot(game: dict, game_id: str, user_id: int) -> tuple[str, discord.ui.View]:
-    """A player's private ballot, showing their unconfirmed picks or current vote."""
-    uid = str(user_id)
-    picks = game.get("picks", {}).get(uid, game["votes"].get(uid, []))
+    """A player's private ballot, showing their unconfirmed picks."""
+    picks = game.get("picks", {}).get(str(user_id), [])
     allowed = votes_allowed(game)
     view = discord.ui.View(timeout=None)
     view.add_item(
@@ -686,10 +688,16 @@ def render_ballot(game: dict, game_id: str, user_id: int) -> tuple[str, discord.
         )
     )
     text = (
-        f"Pick up to {allowed} maps, then click **Confirm vote**. Picks you don't confirm won't count.\n"
+        f"Pick up to {allowed} maps, then click **Confirm vote**. You can only vote once, "
+        "and picks you don't confirm won't count.\n"
         f"Voting ends <t:{int(game['vote_ends_at'])}:R>."
     )
     return text, view
+
+
+def _already_voted_text(game: dict, user_id: int) -> str:
+    names = ", ".join(game["maps"][index] for index in game["votes"][str(user_id)])
+    return f"❌ You already voted for **{names}**. Votes can't be changed."
 
 
 async def _open_ballot_game(interaction: discord.Interaction, game_id: str) -> tuple[dict | None, dict | None]:
@@ -701,6 +709,10 @@ async def _open_ballot_game(interaction: discord.Interaction, game_id: str) -> t
         return None, None
     if interaction.user.id not in players(game):
         await _deny(interaction, "❌ Only the players in this game can vote.")
+        return None, None
+    if str(interaction.user.id) in game["votes"]:
+        # A second ballot left open from before this player confirmed.
+        await interaction.response.edit_message(content=_already_voted_text(game, interaction.user.id), view=None)
         return None, None
     return games, game
 
@@ -720,7 +732,7 @@ async def handle_confirm_vote(interaction: discord.Interaction, game_id: str) ->
     if game is None:
         return
     uid = str(interaction.user.id)
-    picks = game.get("picks", {}).pop(uid, game["votes"].get(uid, []))
+    picks = game.get("picks", {}).pop(uid, [])
     if not picks:
         await _deny(interaction, "❌ Pick at least one map first.")
         return
@@ -731,10 +743,7 @@ async def handle_confirm_vote(interaction: discord.Interaction, game_id: str) ->
     interaction.client.store.update(interaction.guild_id, games=games)
 
     names = ", ".join(game["maps"][index] for index in picks)
-    message = f"✅ Your vote is in: **{names}**."
-    if game["phase"] == "vote":
-        message += " Click **Vote** again to change it before voting ends."
-    await interaction.response.edit_message(content=message, view=None)
+    await interaction.response.edit_message(content=f"✅ Your vote is in: **{names}**.", view=None)
     await _update_game_message(interaction.client, game_id, game)
     if game["phase"] == "playing":
         await open_team_calls(interaction.client, interaction.guild_id, game_id, game)

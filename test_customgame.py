@@ -269,19 +269,28 @@ class VoteTests(CustomGameCase):
         self.assertIn("Pick at least one", self.denial(interaction))
         self.assertEqual(self.game()["votes"], {})
 
-    async def test_player_can_change_a_confirmed_vote(self):
+    async def test_vote_button_refuses_a_player_who_already_voted(self):
         await self.vote(1, 0)
-        await self.vote(1, 1, 2)
-        self.assertEqual(self.game()["votes"], {"1": [1, 2]})
+        interaction = self.interaction(user_id=1, admin=False)
+        await customgame.handle_button(interaction, "ballot", None)
+        self.assertIn("already voted for **A**", self.denial(interaction))
+        interaction.response.send_message.assert_awaited_once()
+        self.assertNotIn("view", interaction.response.send_message.await_args.kwargs)
 
-    async def test_ballot_shows_existing_vote_and_can_reconfirm_it(self):
+    async def test_second_open_ballot_cannot_change_a_confirmed_vote(self):
         await self.vote(1, 0)
+        interaction = await self.vote(1, 1, 2)
+        self.assertEqual(self.game()["votes"], {"1": [0]})
+        self.assertEqual(self.game()["picks"], {})
+        self.assertIn("can't be changed", interaction.response.edit_message.await_args.kwargs["content"])
+        self.assertIsNone(interaction.response.edit_message.await_args.kwargs["view"])
+
+    async def test_ballot_keeps_unconfirmed_picks(self):
+        await customgame.handle_ballot_select(self.interaction(user_id=1), self.game_id, ["0"])
         _, view = customgame.render_ballot(self.game(), self.game_id, 1)
         options = view.children[0].item.options
         self.assertEqual([option.default for option in options], [True, False, False])
         self.assertFalse(view.children[1].item.disabled)
-        await customgame.handle_confirm_vote(self.interaction(user_id=1), self.game_id)
-        self.assertEqual(self.game()["votes"], {"1": [0]})
 
     def test_ballot_limits_the_number_of_picks(self):
         _, view = customgame.render_ballot(self.game(), self.game_id, 1)
