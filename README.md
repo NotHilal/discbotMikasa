@@ -40,6 +40,7 @@ python bot.py
 | `/setup twitch <username>` | The Twitch channel to watch |
 | `/setup tiktok <username>` | The TikTok account to link |
 | `/setup testlive [ping]` | Posts a labelled test announcement. It only pings the ping role if you set `ping` to true. |
+| `/setup scoreboard <channel>` | The channel that always shows the wins and Game Points leaderboards |
 | `/setup maps <maps>` | The custom game maps, separated by commas |
 | `/setup clear <setting>` | Turns off or removes one setting |
 | `/setup show` | Shows this server's current settings |
@@ -50,7 +51,7 @@ Settings, games in progress and leaderboards are saved in `data.json`. Back it u
 
 ## Custom games
 
-An admin (anyone with Manage Server) runs `/customgame`, and one message then moves through each step:
+An admin (anyone with Manage Server) runs `/queue open`, and one message then moves through each step:
 
 1. **Teams:** the admin picks up to 5 players per team from the dropdowns. Each team needs at least one player. Picking someone already on the other team moves them.
 2. **Map vote:** players click **Vote**, pick up to 2 maps on a private ballot and click **Confirm vote**. Picks that aren't confirmed don't count, and a player can vote again to change their choice. The totals stay hidden until voting ends, which happens after 2 minutes, when everyone has confirmed, or when an admin clicks **End vote**. Ties are picked at random.
@@ -72,6 +73,10 @@ When the map is announced, the bot creates **Team 1 Call** and **Team 2 Call** i
 ### Game Points
 
 `/leaderboard board:game points` ranks players by Game Points. Admins manage them with `/addpoints`, `/removepoints` and `/setpoints`, and `/resetleaderboard` clears either leaderboard after a confirmation. `/clearstats <player> <board>` clears one player's wins, Game Points or both.
+
+### Scoreboard channel
+
+`/setup scoreboard <channel>` keeps one message in that channel showing both leaderboards. It updates when a result is reported or undone and when points or stats change, and it also refreshes every hour. If the message is deleted, the bot posts a new one.
 
 ## Role menus
 

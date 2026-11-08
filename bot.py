@@ -42,6 +42,7 @@ CLEARABLE = {
     "twitch": ("twitch_username", "stream_id", "last_seen"),
     "tiktok": ("tiktok_username",),
     "maps": ("maps",),
+    "scoreboard": ("scoreboard_channel_id", "scoreboard_message_id"),
 }
 
 
@@ -213,10 +214,24 @@ async def setup_maps(interaction: discord.Interaction, maps: str):
     await reply(interaction, f"✅ Custom games will vote on: {', '.join(parsed)}.")
 
 
+@setup_group.command(name="scoreboard", description="Set the channel that always shows the custom game leaderboards")
+async def setup_scoreboard(interaction: discord.Interaction, channel: discord.TextChannel):
+    problem = channel_problem(channel, interaction.guild)
+    if problem:
+        await reply(interaction, problem)
+        return
+    store = interaction.client.store
+    # Re-running this for the same channel keeps using the same message.
+    if store.get(interaction.guild_id).get("scoreboard_channel_id") != channel.id:
+        store.update(interaction.guild_id, scoreboard_channel_id=channel.id, scoreboard_message_id=None)
+    await reply(interaction, f"✅ The scoreboard will stay up to date in {channel.mention}.")
+    await customgame.refresh_scoreboard(interaction.client, interaction.guild_id)
+
+
 @setup_group.command(name="clear", description="Turn off or remove one setting")
 async def setup_clear(
     interaction: discord.Interaction,
-    setting: Literal["join role", "welcome", "livenotif", "ping role", "twitch", "tiktok", "maps"],
+    setting: Literal["join role", "welcome", "livenotif", "ping role", "twitch", "tiktok", "maps", "scoreboard"],
 ):
     interaction.client.store.update(interaction.guild_id, **{key: None for key in CLEARABLE[setting]})
     await reply(interaction, f"✅ Cleared **{setting}**.")
@@ -241,6 +256,7 @@ async def setup_show(interaction: discord.Interaction):
                 f"**Twitch:** {settings.get('twitch_username', 'not set')}",
                 f"**TikTok:** {settings.get('tiktok_username', 'not set')}",
                 f"**Custom game maps:** {', '.join(settings.get('maps', customgame.DEFAULT_MAPS))}",
+                f"**Scoreboard channel:** {mention('scoreboard_channel_id', '#')}",
             ]
         ),
     )
@@ -271,10 +287,12 @@ class MikasaBot(discord.Client):
         await self.tree.sync()
         self.check_twitch.start()
         self.check_vote_timers.start()
+        self.refresh_scoreboards.start()
 
     async def close(self) -> None:
         self.check_twitch.cancel()
         self.check_vote_timers.cancel()
+        self.refresh_scoreboards.cancel()
         if self.session:
             await self.session.close()
         await super().close()
@@ -380,6 +398,19 @@ class MikasaBot(discord.Client):
             await customgame.expire_votes(self, time.time())
         except Exception:
             log.exception("Vote timer check failed")
+
+    @tasks.loop(hours=1)
+    async def refresh_scoreboards(self) -> None:
+        # Stats update the scoreboard as they change. This catches any update that failed.
+        for guild in self.guilds:
+            try:
+                await customgame.refresh_scoreboard(self, guild.id)
+            except Exception:
+                log.exception("Scoreboard refresh failed in %s", guild)
+
+    @refresh_scoreboards.before_loop
+    async def _wait_until_ready_for_scoreboards(self) -> None:
+        await self.wait_until_ready()
 
     @check_vote_timers.before_loop
     async def _wait_until_ready_for_votes(self) -> None:

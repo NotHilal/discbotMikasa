@@ -2,7 +2,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 from discord.components import _component_factory
@@ -11,10 +11,6 @@ from discord.ui.view import ViewStore
 import bot
 import customgame
 import storage
-
-
-def user(user_id, is_bot=False):
-    return MagicMock(id=user_id, bot=is_bot)
 
 
 class CustomGameCase(unittest.IsolatedAsyncioTestCase):
@@ -41,7 +37,14 @@ class CustomGameCase(unittest.IsolatedAsyncioTestCase):
         return interaction
 
     def save_game(self, **fields):
-        game = {"phase": "teams", "team_a": [1, 2], "team_b": [3, 4], **fields}
+        game = {
+            "phase": "teams",
+            "queue": [1, 2, 3, 4],
+            "started_early": True,
+            "team_a": [1, 2],
+            "team_b": [3, 4],
+            **fields,
+        }
         self.store.update(self.GUILD_ID, games={str(self.MESSAGE_ID): game})
 
     def game(self):
@@ -105,7 +108,7 @@ class RenderTests(unittest.IsolatedAsyncioTestCase):
         maps = [f"Map {i}" for i in range(customgame.MAX_MAPS)]
         base = {"team_a": [1, 2, 3, 4, 5], "team_b": [6, 7, 8, 9, 10]}
         for game in (
-            {"phase": "teams", **base},
+            {"phase": "teams", "queue": list(range(1, 11)), **base},
             {"phase": "vote", "maps": maps, "votes": {"1": [0, 1]}, "vote_ends_at": 1000, **base},
             {"phase": "playing", "map": "Bind", **base},
             {"phase": "finished", "map": "Bind", "winner": "a", **base},
@@ -125,55 +128,42 @@ class RenderTests(unittest.IsolatedAsyncioTestCase):
             _, view = customgame.render(game)
             return next(i for i in view.children if i.custom_id == "mikasa:game:start").item.disabled
 
-        self.assertTrue(start_disabled({"phase": "teams", "team_a": [1], "team_b": []}))
-        self.assertFalse(start_disabled({"phase": "teams", "team_a": [1], "team_b": [2]}))
+        early = {"phase": "teams", "queue": [1, 2], "started_early": True}
+        self.assertTrue(start_disabled({**early, "team_a": [1], "team_b": []}))
+        self.assertFalse(start_disabled({**early, "team_a": [1], "team_b": [2]}))
 
 
-class StartTests(CustomGameCase):
-    async def test_admin_starts_a_saved_game(self):
-        interaction = self.interaction()
-        interaction.response.send_message.return_value = MagicMock(message_id=self.MESSAGE_ID)
-        await customgame.customgame_command.callback(interaction)
-        self.assertEqual(self.game(), {"phase": "teams", "team_a": [], "team_b": [], "channel_id": 77})
+class CommandAccessTests(unittest.TestCase):
+    def test_customgame_was_removed(self):
+        self.assertNotIn("customgame", [command.name for command in customgame.COMMANDS])
 
-    async def test_non_admin_cannot_start(self):
-        interaction = self.interaction(admin=False)
-        await customgame.customgame_command.callback(interaction)
-        self.assertIsNone(self.game())
-
-    def test_commands_have_the_right_access(self):
-        self.assertTrue(customgame.customgame_command.default_permissions.manage_guild)
+    def test_leaderboard_is_open_to_everyone(self):
         self.assertIsNone(customgame.leaderboard_command.default_permissions)
 
 
 class TeamTests(CustomGameCase):
     async def test_admin_sets_a_team(self):
         self.save_game(team_a=[], team_b=[])
-        await customgame.handle_team_select(self.interaction(), "a", [user(1), user(2)])
+        await customgame._set_team(self.interaction(), "a", [1, 2])
         self.assertEqual(self.game()["team_a"], [1, 2])
 
     async def test_picking_someone_moves_them_from_the_other_team(self):
         self.save_game(team_a=[1], team_b=[2])
-        await customgame.handle_team_select(self.interaction(), "b", [user(1), user(2)])
+        await customgame._set_team(self.interaction(), "b", [1, 2])
         self.assertEqual(self.game()["team_a"], [])
         self.assertEqual(self.game()["team_b"], [1, 2])
-
-    async def test_bots_are_left_out(self):
-        self.save_game(team_a=[], team_b=[])
-        await customgame.handle_team_select(self.interaction(), "a", [user(1), user(2, is_bot=True)])
-        self.assertEqual(self.game()["team_a"], [1])
 
     async def test_non_admin_cannot_set_teams(self):
         self.save_game()
         interaction = self.interaction(admin=False)
-        await customgame.handle_team_select(interaction, "a", [user(9)])
+        await customgame._set_team(interaction, "a", [3])
         self.assertIn("admins", self.denial(interaction))
         self.assertEqual(self.game()["team_a"], [1, 2])
 
     async def test_teams_are_locked_once_the_vote_starts(self):
         self.save_game(phase="vote", maps=["A", "B"], votes={})
         interaction = self.interaction()
-        await customgame.handle_team_select(interaction, "a", [user(9)])
+        await customgame._set_team(interaction, "a", [3])
         self.assertIn("can't be changed", self.denial(interaction))
         self.assertEqual(self.game()["team_a"], [1, 2])
 
@@ -518,18 +508,13 @@ class RestartTests(CustomGameCase):
 
     async def test_team_dropdown_works_after_restart(self):
         self.save_game(team_a=[], team_b=[])
-        with patch.object(
-            discord.app_commands.Namespace,
-            "_get_resolved_items",
-            return_value={(0, 1): user(1), (0, 2): user(2)},
-        ):
-            await self.click(
-                self.game(),
-                "mikasa:team:a",
-                5,
-                customgame.TeamSelect,
-                data={"values": ["1", "2"], "resolved": {}},
-            )
+        await self.click(
+            self.game(),
+            "mikasa:queueteam:a",
+            3,
+            customgame.QueueTeamSelect,
+            data={"values": ["1", "2"]},
+        )
         self.assertEqual(self.game()["team_a"], [1, 2])
 
 

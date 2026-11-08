@@ -7,6 +7,7 @@ game up when clicked, so they keep working after the bot restarts.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import time
@@ -16,6 +17,9 @@ import discord
 from discord import app_commands
 
 log = logging.getLogger("mikasa.customgame")
+
+# Stops two updates at once from each posting a new scoreboard message.
+_scoreboard_lock = asyncio.Lock()
 
 # Every map on playvalorant.com as of patch 13.09. Servers can change it with /setup maps.
 DEFAULT_MAPS = [
@@ -134,7 +138,7 @@ def remove_from_queue(game: dict, user_id: int) -> bool:
 
 
 def needs_full_teams(game: dict) -> bool:
-    return "queue" in game and not game.get("started_early")
+    return not game.get("started_early")
 
 
 def teams_ready(game: dict) -> bool:
@@ -177,19 +181,6 @@ def _button(
 ) -> "GameButton":
     custom_id = f"mikasa:game:{action}" + (f":{arg}" if arg is not None else "")
     return GameButton(discord.ui.Button(label=label, style=style, custom_id=custom_id, disabled=disabled, row=row))
-
-
-def _team_select(game: dict, team: str, row: int) -> "TeamSelect":
-    return TeamSelect(
-        discord.ui.UserSelect(
-            custom_id=f"mikasa:team:{team}",
-            placeholder=f"Pick {TEAM_NAMES[team]}",
-            min_values=0,
-            max_values=MAX_TEAM_SIZE,
-            default_values=[discord.Object(id=user_id) for user_id in game[f"team_{team}"]],
-            row=row,
-        )
-    )
 
 
 def _queue_options(game: dict, selected: list[int] = ()) -> list[discord.SelectOption]:
@@ -251,25 +242,20 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
 
     elif phase == "teams":
         embed = _base_embed("🎮 Custom Game: pick the teams", game, discord.Color.blurple())
-        queued = "queue" in game
-        make_select = _queue_team_select if queued else _team_select
-        view.add_item(make_select(game, "a", 0))
-        view.add_item(make_select(game, "b", 1))
-        if queued:
-            unassigned = [user_id for user_id in game["queue"] if user_id not in players(game)]
-            if game.get("started_early"):
-                embed.description = "The queue was started early. Admins: put at least one player on each team, then confirm."
-            else:
-                embed.description = f"The queue is full. Admins: put {MAX_TEAM_SIZE} players on each team, then confirm."
-            if unassigned:
-                embed.add_field(
-                    name="Not on a team yet", value=" ".join(f"<@{user_id}>" for user_id in unassigned), inline=False
-                )
-            view.add_item(_kick_select(game, 2))
-        row = 3 if queued else 2
-        label = "Confirm teams" if queued else "Start map vote"
-        view.add_item(_button("start", label, discord.ButtonStyle.success, disabled=not teams_ready(game), row=row))
-        view.add_item(_button("cancel", "Cancel", discord.ButtonStyle.secondary, row=row))
+        view.add_item(_queue_team_select(game, "a", 0))
+        view.add_item(_queue_team_select(game, "b", 1))
+        unassigned = [user_id for user_id in game["queue"] if user_id not in players(game)]
+        if game.get("started_early"):
+            embed.description = "The queue was started early. Admins: put at least one player on each team, then confirm."
+        else:
+            embed.description = f"The queue is full. Admins: put {MAX_TEAM_SIZE} players on each team, then confirm."
+        if unassigned:
+            embed.add_field(
+                name="Not on a team yet", value=" ".join(f"<@{user_id}>" for user_id in unassigned), inline=False
+            )
+        view.add_item(_kick_select(game, 2))
+        view.add_item(_button("start", "Confirm teams", discord.ButtonStyle.success, disabled=not teams_ready(game), row=3))
+        view.add_item(_button("cancel", "Cancel", discord.ButtonStyle.secondary, row=3))
 
     elif phase == "vote":
         votes = game["votes"]
@@ -321,10 +307,6 @@ async def _deny(interaction: discord.Interaction, message: str) -> None:
     await interaction.response.send_message(message, ephemeral=True)
 
 
-async def handle_team_select(interaction: discord.Interaction, team: str, selected: list) -> None:
-    await _set_team(interaction, team, [user.id for user in selected if not user.bot])
-
-
 async def _set_team(interaction: discord.Interaction, team: str, chosen: list[int]) -> None:
     if not is_admin(interaction):
         await _deny(interaction, "❌ Only admins can set the teams.")
@@ -337,7 +319,7 @@ async def _set_team(interaction: discord.Interaction, team: str, chosen: list[in
         await _deny(interaction, "❌ The teams for this game can't be changed anymore.")
         return
 
-    if "queue" in game and any(user_id not in game["queue"] for user_id in chosen):
+    if any(user_id not in game["queue"] for user_id in chosen):
         await _deny(interaction, "❌ Only players in the queue can be put on a team.")
         return
     other = "b" if team == "a" else "a"
@@ -414,6 +396,8 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
     await _delete_team_calls(interaction.client, calls_to_delete)
     if game["phase"] == "playing":
         await open_team_calls(interaction.client, interaction.guild_id, key, game)
+    if action in ("won", "undo"):
+        await refresh_scoreboard(interaction.client, interaction.guild_id)
 
 
 async def handle_kick(interaction: discord.Interaction, user_id: int) -> None:
@@ -687,19 +671,6 @@ class ConfirmVote(discord.ui.DynamicItem[discord.ui.Button], template=r"mikasa:c
         await handle_confirm_vote(interaction, self.game_id)
 
 
-class TeamSelect(discord.ui.DynamicItem[discord.ui.UserSelect], template=r"mikasa:team:(?P<team>[ab])"):
-    team: str
-
-    @classmethod
-    async def from_custom_id(cls, interaction, item, match, /):
-        select = cls(item)
-        select.team = match["team"]
-        return select
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await handle_team_select(interaction, self.team, self.item.values)
-
-
 class KickSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"mikasa:queuekick"):
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
@@ -722,7 +693,7 @@ class QueueTeamSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"mika
         await _set_team(interaction, self.team, [int(value) for value in self.item.values])
 
 
-DYNAMIC_ITEMS = (GameButton, TeamSelect, BallotSelect, ConfirmVote, KickSelect, QueueTeamSelect)
+DYNAMIC_ITEMS = (GameButton, BallotSelect, ConfirmVote, KickSelect, QueueTeamSelect)
 
 
 queue_group = app_commands.Group(
@@ -811,25 +782,6 @@ async def queue_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@app_commands.command(name="customgame", description="(Admins only) Start a custom game")
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def customgame_command(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await _deny(interaction, "❌ Only admins can start a custom game.")
-        return
-
-    game = {"phase": "teams", "team_a": [], "team_b": [], "channel_id": interaction.channel_id}
-    embed, view = render(game)
-    callback = await interaction.response.send_message(embed=embed, view=view)
-    message_id = callback.message_id or (await interaction.original_response()).id
-
-    store = interaction.client.store
-    games = store.get(interaction.guild_id).get("games", {})
-    games[str(message_id)] = game
-    store.update(interaction.guild_id, games=games)
-
-
 def build_leaderboard(leaderboard: dict) -> discord.Embed:
     ranked = sorted(leaderboard.items(), key=lambda item: (-item[1]["wins"], item[1]["losses"]))
 
@@ -871,6 +823,32 @@ async def leaderboard_command(interaction: discord.Interaction, board: Literal["
     await interaction.response.send_message(embed=embed)
 
 
+async def refresh_scoreboard(client: discord.Client, guild_id: int) -> None:
+    """Edits the server's scoreboard message, posting a new one if it's gone."""
+    async with _scoreboard_lock:
+        settings = client.store.get(guild_id)
+        channel_id = settings.get("scoreboard_channel_id")
+        if not channel_id:
+            return
+        embeds = [
+            build_leaderboard(settings.get("leaderboard", {})),
+            build_points_leaderboard(settings.get("points", {})),
+        ]
+        channel = client.get_partial_messageable(channel_id)
+        try:
+            message_id = settings.get("scoreboard_message_id")
+            if message_id:
+                try:
+                    await channel.get_partial_message(message_id).edit(embeds=embeds)
+                    return
+                except discord.NotFound:
+                    pass  # someone deleted it, so post a replacement
+            message = await channel.send(embeds=embeds)
+            client.store.update(guild_id, scoreboard_message_id=message.id)
+        except discord.HTTPException:
+            log.exception("Couldn't update the scoreboard for server %s", guild_id)
+
+
 async def _change_points(interaction: discord.Interaction, player: discord.Member, change) -> None:
     if not is_admin(interaction):
         await _deny(interaction, "❌ Only admins can change Game Points.")
@@ -886,6 +864,7 @@ async def _change_points(interaction: discord.Interaction, player: discord.Membe
     await interaction.response.send_message(
         f"✅ {player.mention} now has **{total:,} GP**.", allowed_mentions=discord.AllowedMentions.none()
     )
+    await refresh_scoreboard(interaction.client, interaction.guild_id)
 
 
 Amount = app_commands.Range[int, 1, MAX_POINTS]
@@ -946,6 +925,7 @@ async def clearstats_command(
     await interaction.response.send_message(
         f"✅ Cleared {player.mention}'s {' and '.join(cleared)}.", allowed_mentions=no_pings
     )
+    await refresh_scoreboard(interaction.client, interaction.guild_id)
 
 
 class ConfirmReset(discord.ui.View):
@@ -958,6 +938,7 @@ class ConfirmReset(discord.ui.View):
         key = "leaderboard" if self.board == "wins" else "points"
         interaction.client.store.update(interaction.guild_id, **{key: None})
         await interaction.response.edit_message(content=f"✅ The **{self.board}** leaderboard has been reset.", view=None)
+        await refresh_scoreboard(interaction.client, interaction.guild_id)
 
 
 @app_commands.command(name="resetleaderboard", description="(Admins only) Reset the wins or Game Points leaderboard")
@@ -976,7 +957,6 @@ async def resetleaderboard_command(interaction: discord.Interaction, board: Lite
 
 COMMANDS = (
     queue_group,
-    customgame_command,
     leaderboard_command,
     addpoints_command,
     removepoints_command,

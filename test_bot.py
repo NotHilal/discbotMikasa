@@ -1,11 +1,12 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
 import bot
+import customgame
 import storage
 import twitch
 
@@ -378,6 +379,34 @@ class CommandTests(BotCase):
         with self.assertLogs("mikasa", "ERROR"):
             await bot.setup_testlive.callback(interaction)
         self.assertIn("couldn't post", interaction.response.send_message.await_args.args[0])
+
+    async def test_setup_scoreboard_saves_the_channel_and_refreshes(self):
+        channel = MagicMock(id=88, mention="<#88>")
+        with patch.object(customgame, "refresh_scoreboard", AsyncMock()) as refresh:
+            await bot.setup_scoreboard.callback(self.interaction(), channel)
+        self.assertEqual(self.store.get(1)["scoreboard_channel_id"], 88)
+        refresh.assert_awaited_once_with(self.bot, 1)
+
+    async def test_setup_scoreboard_keeps_the_message_for_the_same_channel(self):
+        self.store.update(1, scoreboard_channel_id=88, scoreboard_message_id=321)
+        with patch.object(customgame, "refresh_scoreboard", AsyncMock()):
+            await bot.setup_scoreboard.callback(self.interaction(), MagicMock(id=88, mention="<#88>"))
+        self.assertEqual(self.store.get(1)["scoreboard_message_id"], 321)
+
+    async def test_setup_scoreboard_starts_fresh_for_a_new_channel(self):
+        self.store.update(1, scoreboard_channel_id=88, scoreboard_message_id=321)
+        with patch.object(customgame, "refresh_scoreboard", AsyncMock()):
+            await bot.setup_scoreboard.callback(self.interaction(), MagicMock(id=99, mention="<#99>"))
+        self.assertEqual(self.store.get(1)["scoreboard_channel_id"], 99)
+        self.assertNotIn("scoreboard_message_id", self.store.get(1))
+
+    async def test_setup_scoreboard_rejects_a_channel_it_cannot_post_in(self):
+        channel = MagicMock(id=88, mention="<#88>")
+        channel.permissions_for.return_value.send_messages = False
+        interaction = self.interaction()
+        await bot.setup_scoreboard.callback(interaction, channel)
+        self.assertIn("can't post", interaction.response.send_message.await_args.args[0])
+        self.assertNotIn("scoreboard_channel_id", self.store.get(1))
 
     async def test_show_lists_settings_and_defaults(self):
         self.store.update(1, twitch_username="me", ping_role_id=7)

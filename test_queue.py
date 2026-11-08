@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 
 import customgame
-from test_customgame import CustomGameCase, user
+from test_customgame import CustomGameCase
 
 
 def payload(user_id, message_id=500, emoji=customgame.QUEUE_EMOJI, is_bot=False, guild_id=1):
@@ -86,9 +86,10 @@ class ReactionTests(QueueCase):
         self.save_queue()
         await self.react(1, message_id=12345)
         self.assertEqual(self.game()["queue"], [])
-        self.save_game()
+        game = {"phase": "playing", "map": "A", "team_a": [2], "team_b": [3], "channel_id": 77}
+        self.store.update(self.GUILD_ID, games={str(self.MESSAGE_ID): game})
         await self.react(1)
-        self.assertNotIn("queue", self.game())
+        self.assertEqual(self.game(), game)
 
 
 class KickTests(QueueCase):
@@ -207,7 +208,7 @@ class QueueTeamTests(QueueCase):
     async def test_only_queued_players_can_be_picked(self):
         self.full()
         interaction = self.interaction()
-        await customgame.handle_team_select(interaction, "a", [user(1), user(50)])
+        await customgame._set_team(interaction, "a", [1, 50])
         self.assertIn("Only players in the queue", self.denial(interaction))
         self.assertEqual(self.game()["team_a"], [])
 
@@ -313,6 +314,80 @@ class QueueCommandTests(QueueCase):
         interaction = self.interaction()
         await customgame.queue_list.callback(interaction)
         self.assertIn("No queues", self.reply(interaction))
+
+
+class ScoreboardTests(CustomGameCase):
+    def setUp(self):
+        super().setUp()
+        self.channel = self.client.get_partial_messageable.return_value
+        self.channel.send = AsyncMock(return_value=MagicMock(id=321))
+        self.edit = AsyncMock()
+        self.channel.get_partial_message.return_value.edit = self.edit
+
+    def configure(self, **fields):
+        self.store.update(self.GUILD_ID, scoreboard_channel_id=88, **fields)
+
+    async def refresh(self):
+        await customgame.refresh_scoreboard(self.client, self.GUILD_ID)
+
+    async def test_does_nothing_without_a_channel(self):
+        await self.refresh()
+        self.channel.send.assert_not_awaited()
+
+    async def test_first_update_posts_and_remembers_the_message(self):
+        self.configure()
+        await self.refresh()
+        self.client.get_partial_messageable.assert_called_once_with(88)
+        titles = [embed.title for embed in self.channel.send.await_args.kwargs["embeds"]]
+        self.assertEqual(titles, ["🏆 Leaderboard", "🏆 Game Points Leaderboard"])
+        self.assertEqual(self.store.get(self.GUILD_ID)["scoreboard_message_id"], 321)
+
+    async def test_later_updates_edit_the_same_message(self):
+        self.configure(scoreboard_message_id=321, points={"1": 500})
+        await self.refresh()
+        self.channel.send.assert_not_awaited()
+        self.channel.get_partial_message.assert_called_once_with(321)
+        self.assertIn("500 GP", self.edit.await_args.kwargs["embeds"][1].description)
+
+    async def test_deleted_message_is_replaced(self):
+        self.configure(scoreboard_message_id=321)
+        self.edit.side_effect = discord.NotFound(MagicMock(status=404, reason="gone"), "gone")
+        self.channel.send.return_value = MagicMock(id=654)
+        await self.refresh()
+        self.assertEqual(self.store.get(self.GUILD_ID)["scoreboard_message_id"], 654)
+
+    async def test_failure_is_logged_and_does_not_raise(self):
+        self.configure()
+        self.channel.send.side_effect = discord.Forbidden(MagicMock(status=403, reason="no"), "no")
+        with self.assertLogs("mikasa.customgame", "ERROR"):
+            await self.refresh()
+
+    async def test_points_commands_update_it(self):
+        self.configure(scoreboard_message_id=321)
+        player = MagicMock(id=1, mention="<@1>")
+        await customgame.addpoints_command.callback(self.interaction(), player, 75)
+        self.assertIn("75 GP", self.edit.await_args.kwargs["embeds"][1].description)
+
+    async def test_clearstats_updates_it(self):
+        self.configure(scoreboard_message_id=321, points={"1": 75})
+        await customgame.clearstats_command.callback(self.interaction(), MagicMock(id=1, mention="<@1>"), "both")
+        self.assertIn("Nobody", self.edit.await_args.kwargs["embeds"][1].description)
+
+    async def test_reset_updates_it(self):
+        self.configure(scoreboard_message_id=321, points={"1": 75})
+        interaction = self.interaction()
+        await customgame.resetleaderboard_command.callback(interaction, "game points")
+        view = interaction.response.send_message.await_args.kwargs["view"]
+        await view.confirm.callback(self.interaction())
+        self.assertIn("Nobody", self.edit.await_args.kwargs["embeds"][1].description)
+
+    async def test_result_and_undo_update_it(self):
+        self.configure(scoreboard_message_id=321)
+        self.save_game(phase="playing", map="Bind", maps=["Bind"], votes={}, channel_id=77)
+        await customgame.handle_button(self.interaction(), "won", "a")
+        self.assertIn("1 win", self.edit.await_args.kwargs["embeds"][0].description)
+        await customgame.handle_button(self.interaction(), "undo", None)
+        self.assertIn("No games", self.edit.await_args.kwargs["embeds"][0].description)
 
 
 class CallTests(QueueCase):
