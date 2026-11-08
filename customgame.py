@@ -45,6 +45,7 @@ VOTES_PER_PLAYER = 2
 VOTE_SECONDS = 2 * 60
 
 QUEUE_SIZE = 10
+MIN_PLAYERS_TO_START = 2
 QUEUE_EMOJI = "✅"
 MAX_POINTS = 1_000_000
 
@@ -52,6 +53,7 @@ TEAM_NAMES = {"a": "Team 1", "b": "Team 2"}
 
 # Which phases each button is valid in, so stale or double clicks do nothing.
 ACTION_PHASES = {
+    "startearly": {"queue"},
     "start": {"teams"},
     "cancel": {"queue", "teams", "vote", "playing"},
     "ballot": {"vote"},
@@ -238,6 +240,8 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
         )
         if game["queue"]:  # Discord refuses a dropdown with no options
             view.add_item(_kick_select(game, 0))
+        too_few = len(game["queue"]) < MIN_PLAYERS_TO_START
+        view.add_item(_button("startearly", "Start early", discord.ButtonStyle.success, disabled=too_few, row=1))
         view.add_item(_button("cancel", "Cancel", discord.ButtonStyle.secondary, row=1))
 
     elif phase == "teams":
@@ -413,6 +417,12 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         text, view = render_ballot(game, key, interaction.user.id)
         await interaction.response.send_message(text, view=view, ephemeral=True)
         return
+    elif action == "startearly":
+        if len(game["queue"]) < MIN_PLAYERS_TO_START:
+            await _deny(interaction, f"❌ The queue needs at least {MIN_PLAYERS_TO_START} players to start.")
+            return
+        game["phase"] = "teams"
+        game["started_early"] = True
     elif action == "start":
         if not teams_ready(game):
             needed = f"exactly {MAX_TEAM_SIZE} players" if needs_full_teams(game) else "at least one player"
@@ -455,6 +465,8 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
     await _delete_team_calls(interaction.client, calls_to_delete)
     if game["phase"] == "playing":
         await open_team_calls(interaction.client, interaction.guild_id, key, game)
+    if action == "startearly":
+        await announce_queue_started(interaction.client, game)
     if action in ("won", "undo"):
         await refresh_scoreboard(interaction.client, interaction.guild_id)
 
@@ -517,6 +529,8 @@ async def handle_queue_reaction(client: discord.Client, payload: discord.RawReac
         game["phase"] = "teams"
     client.store.update(payload.guild_id, games=games)
     await _update_game_message(client, key, game)
+    if game["phase"] == "teams":
+        await announce_queue_started(client, game)
 
 
 async def open_team_calls(client: discord.Client, guild_id: int, game_id: str, game: dict) -> None:
@@ -587,6 +601,17 @@ async def _edit_game_messages(client: discord.Client, game_id: str, game: dict, 
             await client.get_partial_messageable(channel_id).get_partial_message(message_id).edit(embed=embed, view=view)
         except discord.HTTPException:
             log.exception("Couldn't update the custom game message %s", message_id)
+
+
+async def announce_queue_started(client: discord.Client, game: dict) -> None:
+    """Posts a new message in the player channel, since edits don't notify anyone."""
+    text = f"🎮 **The queue has started with {len(game['queue'])} players!** Admins are picking the teams."
+    try:
+        await client.get_partial_messageable(game["channel_id"]).send(
+            text, allowed_mentions=discord.AllowedMentions.none()
+        )
+    except discord.HTTPException:
+        log.exception("Couldn't announce the queue start in channel %s", game["channel_id"])
 
 
 async def _update_game_message(client: discord.Client, game_id: str, game: dict, skip: int | None = None) -> None:
@@ -848,8 +873,8 @@ async def queue_start(interaction: discord.Interaction):
         return
     key = str(max(open_here))
     game = games[key]
-    if len(game["queue"]) < 2:
-        await _deny(interaction, "❌ The queue needs at least 2 players to start.")
+    if len(game["queue"]) < MIN_PLAYERS_TO_START:
+        await _deny(interaction, f"❌ The queue needs at least {MIN_PLAYERS_TO_START} players to start.")
         return
 
     game["phase"] = "teams"
@@ -857,6 +882,7 @@ async def queue_start(interaction: discord.Interaction):
     store.update(interaction.guild_id, games=games)
     await interaction.response.send_message(f"✅ Started the queue early with {len(game['queue'])} players.")
     await _update_game_message(interaction.client, key, game)
+    await announce_queue_started(interaction.client, game)
 
 
 @queue_group.command(name="list", description="List the custom game queues in this server")

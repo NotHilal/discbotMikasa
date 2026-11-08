@@ -22,6 +22,8 @@ class QueueCase(CustomGameCase):
         partial.edit = AsyncMock()
         partial.remove_reaction = AsyncMock()
         self.partial = partial
+        self.send = AsyncMock()
+        self.client.get_partial_messageable.return_value.send = self.send
 
     def save_queue(self, queue=(), **fields):
         game = {"phase": "queue", "queue": list(queue), "team_a": [], "team_b": [], "channel_id": 77, **fields}
@@ -312,6 +314,55 @@ class QueueCommandTests(QueueCase):
         self.assertIn("No queues", self.reply(interaction))
 
 
+class QueueStartedMessageTests(QueueCase):
+    def assert_announced_to_players(self, players):
+        self.send.assert_awaited_once()
+        self.assertIn(f"started with {players} players", self.send.await_args.args[0])
+        self.assertFalse(self.send.await_args.kwargs["allowed_mentions"].everyone)
+        self.client.get_partial_messageable.assert_any_call(55)
+
+    def panel_queue(self, queue):
+        self.save_queue(queue, channel_id=55, panel_channel_id=77, panel_id=600)
+
+    async def test_full_queue_announces(self):
+        self.panel_queue(range(1, 10))
+        await self.react(10)
+        self.assert_announced_to_players(10)
+
+    async def test_joining_before_full_does_not_announce(self):
+        self.panel_queue([1])
+        await self.react(2)
+        self.send.assert_not_awaited()
+
+    async def test_start_early_button_announces(self):
+        self.panel_queue([1, 2])
+        interaction = self.interaction()
+        interaction.message.id = 600
+        await customgame.handle_button(interaction, "startearly", None)
+        self.assert_announced_to_players(2)
+
+    async def test_queue_start_command_announces(self):
+        self.panel_queue([1, 2, 3])
+        await customgame.queue_start.callback(self.interaction())
+        self.assert_announced_to_players(3)
+
+    async def test_failed_start_does_not_announce(self):
+        self.panel_queue([1])
+        interaction = self.interaction()
+        interaction.message.id = 600
+        await customgame.handle_button(interaction, "startearly", None)
+        self.send.assert_not_awaited()
+
+    async def test_failed_announcement_does_not_stop_the_queue(self):
+        self.panel_queue([1, 2])
+        self.send.side_effect = discord.Forbidden(MagicMock(status=403, reason="no"), "no")
+        interaction = self.interaction()
+        interaction.message.id = 600
+        with self.assertLogs("mikasa.customgame", "ERROR"):
+            await customgame.handle_button(interaction, "startearly", None)
+        self.assertEqual(self.game()["phase"], "teams")
+
+
 class AdminPanelTests(QueueCase):
     PANEL_ID = 600
 
@@ -431,6 +482,41 @@ class AdminPanelTests(QueueCase):
         await customgame.queue_open.callback(interaction, channel)
         self.assertIn("can't run a queue", self.denial(interaction))
         channel.send.assert_not_awaited()
+
+    def early_button(self, game):
+        _, view = customgame.render_admin(game)
+        return next(item for item in view.children if item.custom_id == "mikasa:game:startearly").item
+
+    async def test_panel_button_starts_the_queue_early(self):
+        self.save_queue([1, 2], channel_id=55, panel_channel_id=77, panel_id=self.PANEL_ID)
+        await customgame.handle_button(self.panel_click(), "startearly", None)
+        self.assertEqual(self.game()["phase"], "teams")
+        self.assertTrue(self.game()["started_early"])
+        self.assertIn("Admins are picking", self.partial.edit.await_args.kwargs["embed"].description)
+
+    async def test_start_early_button_needs_two_players(self):
+        self.save_queue([1], channel_id=55, panel_channel_id=77, panel_id=self.PANEL_ID)
+        self.assertTrue(self.early_button(self.game()).disabled)
+        interaction = self.panel_click()
+        await customgame.handle_button(interaction, "startearly", None)
+        self.assertIn("at least 2", self.denial(interaction))
+        self.assertEqual(self.game()["phase"], "queue")
+
+    async def test_start_early_button_enables_at_two_players(self):
+        self.save_queue([1, 2], channel_id=55, panel_channel_id=77, panel_id=self.PANEL_ID)
+        self.assertFalse(self.early_button(self.game()).disabled)
+
+    async def test_players_cannot_start_early(self):
+        self.save_queue([1, 2], channel_id=55, panel_channel_id=77, panel_id=self.PANEL_ID)
+        interaction = self.panel_click(admin=False)
+        await customgame.handle_button(interaction, "startearly", None)
+        self.assertIn("admins", self.denial(interaction))
+        self.assertEqual(self.game()["phase"], "queue")
+
+    async def test_start_early_is_not_shown_to_players(self):
+        game = {"phase": "queue", "queue": [1, 2], "team_a": [], "team_b": [], "channel_id": 55, "panel_id": 600}
+        _, view = customgame.render_public(game)
+        self.assertEqual(view.children, [])
 
     async def test_only_admins_open(self):
         interaction = self.interaction(admin=False)
