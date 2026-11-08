@@ -632,6 +632,72 @@ class CallTests(QueueCase):
         self.assertEqual([channel.name for channel in self.created], ["Team 1 Call", "Team 2 Call"])
         self.assertEqual(self.game()["call_ids"], [100, 101])
 
+    async def test_players_are_told_which_call_to_join(self):
+        self.vote_game()
+        await customgame.handle_button(self.interaction(), "endvote", None)
+        self.send.assert_awaited_once()
+        text = self.send.await_args.args[0]
+        self.assertIn("**Team 1** → <#100>: <@1>", text)
+        self.assertIn("**Team 2** → <#101>: <@2>", text)
+        mentions = self.send.await_args.kwargs["allowed_mentions"]
+        self.assertTrue(mentions.users)
+        self.assertFalse(mentions.everyone)
+        self.client.get_partial_messageable.assert_any_call(77)
+
+    async def test_results_message_has_totals_and_the_map(self):
+        self.save_game(
+            phase="vote", team_a=[1], team_b=[2], maps=["A", "B", "C"], votes={"1": [1, 0], "2": [1]},
+            picks={}, vote_ends_at=1, channel_id=77,
+        )
+        await customgame.handle_button(self.interaction(), "endvote", None)
+        lines = self.send.await_args.args[0].split("\n")
+        self.assertEqual(lines[:3], ["🗳️ **Map vote results**", "B: **2**", "A: **1**"])
+        self.assertIn("🗺️ **Map: B**", lines)
+
+    async def test_results_message_when_nobody_voted(self):
+        self.vote_game()
+        await customgame.handle_button(self.interaction(), "endvote", None)
+        text = self.send.await_args.args[0]
+        self.assertIn("No votes were cast.", text)
+        self.assertIn("picked at random", text)
+
+    async def test_player_message_is_not_changed_into_the_results(self):
+        self.save_game(
+            phase="playing", map="A", maps=["A", "B"], votes={"1": [0]}, channel_id=55,
+            panel_id=600, panel_channel_id=77, call_ids=[100, 101],
+        )
+        embed, view = customgame.render_public(self.game())
+        self.assertIn("closed", embed.title)
+        self.assertEqual(embed.fields, [])
+        self.assertEqual(view.children, [])
+        embed, _ = customgame.render_admin(self.game())
+        self.assertIn("Map: A", embed.title)
+
+    async def test_finished_player_message_shows_the_winner_without_totals(self):
+        self.save_game(
+            phase="finished", map="A", winner="a", maps=["A", "B"], votes={"1": [0]}, channel_id=55,
+            panel_id=600, panel_channel_id=77,
+        )
+        embed, _ = customgame.render_public(self.game())
+        self.assertIn("Team 1 won", embed.title)
+        self.assertNotIn("Votes", [field.name for field in embed.fields])
+
+    async def test_failed_calls_send_no_join_message(self):
+        self.vote_game()
+        self.guild.create_voice_channel.side_effect = discord.Forbidden(MagicMock(status=403, reason="no"), "no")
+        with self.assertLogs("mikasa.customgame", "ERROR"):
+            await customgame.handle_button(self.interaction(), "endvote", None)
+        self.send.assert_awaited_once()
+        self.assertIn("Map:", self.send.await_args.args[0])
+        self.assertNotIn("Join your team", self.send.await_args.args[0])
+
+    async def test_failed_join_message_keeps_the_calls(self):
+        self.vote_game()
+        self.send.side_effect = discord.Forbidden(MagicMock(status=403, reason="no"), "no")
+        with self.assertLogs("mikasa.customgame", "ERROR"):
+            await customgame.handle_button(self.interaction(), "endvote", None)
+        self.assertEqual(self.game()["call_ids"], [100, 101])
+
     async def test_each_call_only_lets_its_own_team_connect(self):
         self.vote_game()
         await customgame.handle_button(self.interaction(), "endvote", None)

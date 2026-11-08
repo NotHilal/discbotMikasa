@@ -68,7 +68,7 @@ If a player removes their reaction or an admin kicks them with the dropdown befo
 
 ### Team calls
 
-When the map is announced, the bot creates **Team 1 Call** and **Team 2 Call** in the same category as the game, and only each team's players can join theirs. Both are deleted when an admin reports the winner or cancels the game. This needs the **Manage Channels** and **Connect** permissions, and the queue needs **Add Reactions**, **Read Message History** and **Manage Messages**.
+When the map is announced, the bot creates **Team 1 Call** and **Team 2 Call** in the same category as the game, and only each team's players can join theirs. When the vote ends, the bot posts a new message in the player channel with the vote totals, the chosen map and a ping telling each player which call to join. Both are deleted when an admin reports the winner or cancels the game. This needs the **Manage Channels** and **Connect** permissions, and the queue needs **Add Reactions**, **Read Message History** and **Manage Messages**.
 
 ### Game Points
 

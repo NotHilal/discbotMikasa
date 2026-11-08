@@ -323,9 +323,16 @@ def render_public(game: dict) -> tuple[discord.Embed, discord.ui.View]:
             color=discord.Color.blurple(),
         )
         embed.add_field(name="Players", value="\n".join(f"<@{user_id}>" for user_id in game["queue"]), inline=False)
-    # Permission warnings are for the admins.
+    elif game["phase"] == "playing":
+        # The totals, the map and the calls go in their own new message instead.
+        embed = discord.Embed(
+            title="🗳️ Voting has closed",
+            description="The results are in the message below.",
+            color=discord.Color.dark_grey(),
+        )
+    # Permission warnings are for the admins, and the totals are in the results message.
     for index, field in reversed(list(enumerate(embed.fields))):
-        if field.value.startswith("⚠️"):
+        if field.name == "Votes" or field.value.startswith("⚠️"):
             embed.remove_field(index)
     return embed, view
 
@@ -568,12 +575,40 @@ async def open_team_calls(client: discord.Client, guild_id: int, game_id: str, g
             current["calls_failed"] = True
             client.store.update(guild_id, games=games)
             await _update_game_message(client, game_id, current)
+            await _announce_vote_result(client, current)
         return
 
     current.pop("calls_failed", None)
     current["call_ids"] = [call.id for call in created]
     client.store.update(guild_id, games=games)
     await _update_game_message(client, game_id, current)
+    await _announce_vote_result(client, current)
+
+
+def vote_result_text(game: dict) -> str:
+    """The player channel's message: vote totals, the map, and who joins which call."""
+    counts = count_votes(game["maps"], game["votes"])
+    ranked = sorted(zip(game["maps"], counts), key=lambda pair: -pair[1])
+    totals = [f"{name}: **{count}**" for name, count in ranked if count]
+    lines = ["🗳️ **Map vote results**", *(totals or ["No votes were cast."]), "", f"🗺️ **Map: {game['map']}**"]
+    if game.get("map_note"):
+        lines.append(game["map_note"])
+    if game.get("call_ids"):
+        lines += ["", "🔊 **Join your team's call:**"]
+        for team, channel_id in zip(("a", "b"), game["call_ids"]):
+            mentions = " ".join(f"<@{user_id}>" for user_id in game[f"team_{team}"])
+            lines.append(f"**{TEAM_NAMES[team]}** → <#{channel_id}>: {mentions}")
+    return "\n".join(lines)
+
+
+async def _announce_vote_result(client: discord.Client, game: dict) -> None:
+    try:
+        await client.get_partial_messageable(game["channel_id"]).send(
+            vote_result_text(game),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+        )
+    except discord.HTTPException:
+        log.exception("Couldn't post the vote result in channel %s", game["channel_id"])
 
 
 async def _delete_team_calls(client: discord.Client, channel_ids: list[int], known: list | None = None) -> None:
