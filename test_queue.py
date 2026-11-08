@@ -100,6 +100,26 @@ class KickTests(QueueCase):
         self.assertEqual(self.game()["queue"], [2])
         interaction.message.remove_reaction.assert_awaited_once()
 
+    async def test_kicked_player_cannot_rejoin_that_queue(self):
+        self.save_queue([1, 2])
+        interaction = self.interaction()
+        interaction.message.remove_reaction = AsyncMock()
+        await customgame.handle_kick(interaction, 1)
+        await self.react(1)
+        self.assertEqual(self.game()["queue"], [2])
+        self.assertEqual(self.partial.remove_reaction.await_args.args[1].id, 1)
+
+    async def test_other_players_can_still_join_after_a_kick(self):
+        self.save_queue([1], kicked=[9])
+        await self.react(2)
+        self.assertEqual(self.game()["queue"], [1, 2])
+
+    async def test_player_who_left_by_themselves_can_rejoin(self):
+        self.save_queue([1])
+        await self.react(1, adding=False)
+        await self.react(1)
+        self.assertEqual(self.game()["queue"], [1])
+
     async def test_kicking_from_a_full_queue_reopens_it(self):
         self.save_queue(range(1, 11), phase="teams")
         interaction = self.interaction()
@@ -440,6 +460,54 @@ class PointsTests(CustomGameCase):
         await view.confirm.callback(click)
         self.assertEqual(self.points(), {})
         self.assertIn("3", self.store.get(self.GUILD_ID)["leaderboard"])
+
+    def seed_stats(self):
+        self.store.update(
+            self.GUILD_ID,
+            points={"1": 10, "2": 20},
+            leaderboard={"1": {"wins": 3, "losses": 1}, "2": {"wins": 2, "losses": 2}},
+        )
+
+    def board(self):
+        return self.store.get(self.GUILD_ID).get("leaderboard", {})
+
+    async def test_clearstats_wins_only_touches_that_player_and_board(self):
+        self.seed_stats()
+        await customgame.clearstats_command.callback(self.interaction(), self.player(1), "wins")
+        self.assertNotIn("1", self.board())
+        self.assertIn("2", self.board())
+        self.assertEqual(self.points(), {"1": 10, "2": 20})
+
+    async def test_clearstats_game_points_only(self):
+        self.seed_stats()
+        await customgame.clearstats_command.callback(self.interaction(), self.player(1), "game points")
+        self.assertEqual(self.points(), {"2": 20})
+        self.assertIn("1", self.board())
+
+    async def test_clearstats_both(self):
+        self.seed_stats()
+        interaction = self.interaction()
+        await customgame.clearstats_command.callback(interaction, self.player(1), "both")
+        self.assertEqual(self.points(), {"2": 20})
+        self.assertNotIn("1", self.board())
+        call = interaction.response.send_message.await_args
+        self.assertIn("wins and losses and Game Points", call.args[0])
+        self.assertFalse(call.kwargs["allowed_mentions"].users)
+
+    async def test_clearstats_with_nothing_to_clear_says_so(self):
+        self.seed_stats()
+        interaction = self.interaction()
+        await customgame.clearstats_command.callback(interaction, self.player(9), "both")
+        self.assertIn("nothing to clear", interaction.response.send_message.await_args.args[0])
+        self.assertEqual(self.points(), {"1": 10, "2": 20})
+
+    async def test_only_admins_clear_stats(self):
+        self.seed_stats()
+        interaction = self.interaction(admin=False)
+        await customgame.clearstats_command.callback(interaction, self.player(1), "both")
+        self.assertIn("admins", self.denial(interaction))
+        self.assertEqual(self.points(), {"1": 10, "2": 20})
+        self.assertTrue(customgame.clearstats_command.default_permissions.manage_guild)
 
     async def test_only_admins_reset(self):
         interaction = self.interaction(admin=False)

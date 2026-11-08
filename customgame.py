@@ -430,6 +430,7 @@ async def handle_kick(interaction: discord.Interaction, user_id: int) -> None:
     if not remove_from_queue(game, user_id):
         await _deny(interaction, "❌ That player isn't in the queue.")
         return
+    game.setdefault("kicked", []).append(user_id)
 
     store.update(interaction.guild_id, games=games)
     embed, view = render(game)
@@ -457,8 +458,8 @@ async def handle_queue_reaction(client: discord.Client, payload: discord.RawReac
 
     if payload.user_id in game["queue"] or (payload.member is not None and payload.member.bot):
         return
-    if game["phase"] != "queue":
-        # Closed, so this reaction didn't get them in. Don't leave it looking like it did.
+    if game["phase"] != "queue" or payload.user_id in game.get("kicked", []):
+        # Closed or kicked, so this reaction didn't get them in. Don't leave it looking like it did.
         message = client.get_partial_messageable(game["channel_id"]).get_partial_message(payload.message_id)
         try:
             await message.remove_reaction(QUEUE_EMOJI, discord.Object(id=payload.user_id))
@@ -913,6 +914,40 @@ async def setpoints_command(
     await _change_points(interaction, player, lambda current: amount)
 
 
+@app_commands.command(name="clearstats", description="(Admins only) Clear one player's wins, Game Points or both")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def clearstats_command(
+    interaction: discord.Interaction, player: discord.User, board: Literal["wins", "game points", "both"]
+):
+    if not is_admin(interaction):
+        await _deny(interaction, "❌ Only admins can clear a player's stats.")
+        return
+
+    store = interaction.client.store
+    settings = store.get(interaction.guild_id)
+    leaderboard = settings.get("leaderboard", {})
+    points = settings.get("points", {})
+    uid = str(player.id)
+
+    cleared = []
+    if board in ("wins", "both") and leaderboard.pop(uid, None) is not None:
+        cleared.append("wins and losses")
+    if board in ("game points", "both") and points.pop(uid, None) is not None:
+        cleared.append("Game Points")
+
+    no_pings = discord.AllowedMentions.none()
+    if not cleared:
+        await interaction.response.send_message(
+            f"❌ {player.mention} has nothing to clear on that leaderboard.", allowed_mentions=no_pings
+        )
+        return
+    store.update(interaction.guild_id, leaderboard=leaderboard, points=points)
+    await interaction.response.send_message(
+        f"✅ Cleared {player.mention}'s {' and '.join(cleared)}.", allowed_mentions=no_pings
+    )
+
+
 class ConfirmReset(discord.ui.View):
     def __init__(self, board: str):
         super().__init__(timeout=60)
@@ -947,4 +982,5 @@ COMMANDS = (
     removepoints_command,
     setpoints_command,
     resetleaderboard_command,
+    clearstats_command,
 )
