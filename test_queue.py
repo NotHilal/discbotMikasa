@@ -168,6 +168,83 @@ class QueueTeamTests(QueueCase):
         self.assertIsNone(self.game())
 
 
+class QueueCommandTests(QueueCase):
+    def reply(self, interaction):
+        call = interaction.response.send_message.await_args
+        return call.args[0] if call.args else call.kwargs["embed"].description
+
+    def test_queue_is_a_group_for_server_managers(self):
+        self.assertTrue(customgame.queue_group.guild_only)
+        self.assertTrue(customgame.queue_group.default_permissions.manage_guild)
+        self.assertEqual(sorted(c.name for c in customgame.queue_group.commands), ["list", "open", "start"])
+
+    async def test_start_closes_the_queue_early(self):
+        self.save_queue([1, 2])
+        await customgame.queue_start.callback(self.interaction())
+        self.assertEqual(self.game()["phase"], "teams")
+        self.assertIn("started early", self.partial.edit.await_args.kwargs["embed"].description)
+
+    async def test_start_needs_two_players(self):
+        self.save_queue([1])
+        interaction = self.interaction()
+        await customgame.queue_start.callback(interaction)
+        self.assertIn("at least 2", self.denial(interaction))
+        self.assertEqual(self.game()["phase"], "queue")
+
+    async def test_start_needs_an_open_queue_in_this_channel(self):
+        self.save_queue([1, 2], channel_id=55)
+        interaction = self.interaction()
+        await customgame.queue_start.callback(interaction)
+        self.assertIn("no open queue", self.denial(interaction))
+
+    async def test_start_picks_the_newest_queue(self):
+        older = {"phase": "queue", "queue": [1, 2], "team_a": [], "team_b": [], "channel_id": 77}
+        newer = {**older, "queue": [3, 4]}
+        self.store.update(self.GUILD_ID, games={"400": older, "500": newer})
+        await customgame.queue_start.callback(self.interaction())
+        games = self.store.get(self.GUILD_ID)["games"]
+        self.assertEqual(games["400"]["phase"], "queue")
+        self.assertEqual(games["500"]["phase"], "teams")
+
+    async def test_started_queue_allows_small_teams(self):
+        self.save_queue([1, 2], phase="teams", started_early=True, team_a=[1], team_b=[2])
+        await customgame.handle_button(self.interaction(), "start", None)
+        self.assertEqual(self.game()["phase"], "vote")
+
+    async def test_leaving_a_started_queue_reopens_it_normally(self):
+        self.save_queue([1, 2], phase="teams", started_early=True)
+        await self.react(1, adding=False)
+        self.assertEqual(self.game()["phase"], "queue")
+        self.assertNotIn("started_early", self.game())
+
+    async def test_only_admins_can_start_or_list(self):
+        self.save_queue([1, 2])
+        for command in (customgame.queue_start, customgame.queue_list):
+            interaction = self.interaction(admin=False)
+            await command.callback(interaction)
+            self.assertIn("admins", self.denial(interaction))
+        self.assertEqual(self.game()["phase"], "queue")
+
+    async def test_list_shows_queues_with_links_and_skips_other_games(self):
+        queue = {"phase": "queue", "queue": [1], "team_a": [], "team_b": [], "channel_id": 77}
+        teams = {**queue, "phase": "teams", "queue": list(range(1, 11))}
+        finished = {**queue, "phase": "finished", "winner": "a"}
+        plain = {"phase": "teams", "team_a": [], "team_b": [], "channel_id": 77}
+        self.store.update(self.GUILD_ID, games={"10": queue, "20": teams, "30": finished, "40": plain})
+        interaction = self.interaction()
+        await customgame.queue_list.callback(interaction)
+        lines = self.reply(interaction).split("\n")
+        self.assertEqual(len(lines), 2)
+        self.assertIn("1/10, open", lines[0])
+        self.assertIn("https://discord.com/channels/1/77/10", lines[0])
+        self.assertIn("10/10, picking teams", lines[1])
+
+    async def test_list_when_empty(self):
+        interaction = self.interaction()
+        await customgame.queue_list.callback(interaction)
+        self.assertIn("No queues", self.reply(interaction))
+
+
 class CallTests(QueueCase):
     def setUp(self):
         super().setUp()

@@ -128,11 +128,16 @@ def remove_from_queue(game: dict, user_id: int) -> bool:
     game["team_a"] = [member for member in game["team_a"] if member != user_id]
     game["team_b"] = [member for member in game["team_b"] if member != user_id]
     game["phase"] = "queue"
+    game.pop("started_early", None)
     return True
 
 
+def needs_full_teams(game: dict) -> bool:
+    return "queue" in game and not game.get("started_early")
+
+
 def teams_ready(game: dict) -> bool:
-    if "queue" in game:
+    if needs_full_teams(game):
         return len(game["team_a"]) == MAX_TEAM_SIZE and len(game["team_b"]) == MAX_TEAM_SIZE
     return bool(game["team_a"] and game["team_b"])
 
@@ -222,7 +227,10 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
         queued = "queue" in game
         if queued:
             unassigned = [user_id for user_id in game["queue"] if user_id not in players(game)]
-            embed.description = f"The queue is full. Admins: put {MAX_TEAM_SIZE} players on each team, then confirm."
+            if game.get("started_early"):
+                embed.description = "The queue was started early. Admins: put at least one player on each team, then confirm."
+            else:
+                embed.description = f"The queue is full. Admins: put {MAX_TEAM_SIZE} players on each team, then confirm."
             if unassigned:
                 embed.add_field(
                     name="Not on a team yet", value=" ".join(f"<@{user_id}>" for user_id in unassigned), inline=False
@@ -339,7 +347,7 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         return
     elif action == "start":
         if not teams_ready(game):
-            needed = f"exactly {MAX_TEAM_SIZE} players" if "queue" in game else "at least one player"
+            needed = f"exactly {MAX_TEAM_SIZE} players" if needs_full_teams(game) else "at least one player"
             await _deny(interaction, f"❌ Both teams need {needed}.")
             return
         game["maps"] = settings.get("maps", DEFAULT_MAPS)
@@ -669,10 +677,16 @@ class KickSelect(discord.ui.DynamicItem[discord.ui.UserSelect], template=r"mikas
 DYNAMIC_ITEMS = (GameButton, TeamSelect, BallotSelect, ConfirmVote, KickSelect)
 
 
-@app_commands.command(name="queue", description="(Admins only) Open a 10-player custom game queue")
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def queue_command(interaction: discord.Interaction):
+queue_group = app_commands.Group(
+    name="queue",
+    description="(Admins only) Manage custom game queues",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+@queue_group.command(name="open", description="Open a 10-player custom game queue in this channel")
+async def queue_open(interaction: discord.Interaction):
     if not is_admin(interaction):
         await _deny(interaction, "❌ Only admins can open a queue.")
         return
@@ -695,6 +709,58 @@ async def queue_command(interaction: discord.Interaction):
             "but I need Add Reactions and Read Message History.",
             ephemeral=True,
         )
+
+
+@queue_group.command(name="start", description="Close this channel's newest open queue early and pick teams")
+async def queue_start(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await _deny(interaction, "❌ Only admins can start a queue.")
+        return
+
+    store = interaction.client.store
+    games = store.get(interaction.guild_id).get("games", {})
+    open_here = [
+        int(key)
+        for key, game in games.items()
+        if game["phase"] == "queue" and "queue" in game and game["channel_id"] == interaction.channel_id
+    ]
+    if not open_here:
+        await _deny(interaction, "❌ There's no open queue in this channel. Run `/queue open` first.")
+        return
+    key = str(max(open_here))
+    game = games[key]
+    if len(game["queue"]) < 2:
+        await _deny(interaction, "❌ The queue needs at least 2 players to start.")
+        return
+
+    game["phase"] = "teams"
+    game["started_early"] = True
+    store.update(interaction.guild_id, games=games)
+    await interaction.response.send_message(f"✅ Started the queue early with {len(game['queue'])} players.")
+    await _update_game_message(interaction.client, key, game)
+
+
+@queue_group.command(name="list", description="List the custom game queues in this server")
+async def queue_list(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await _deny(interaction, "❌ Only admins can list queues.")
+        return
+
+    games = interaction.client.store.get(interaction.guild_id).get("games", {})
+    labels = {"queue": "open", "teams": "picking teams"}
+    lines = [
+        f"• <#{game['channel_id']}>: {len(game['queue'])}/{QUEUE_SIZE}, {labels[game['phase']]} "
+        f"([jump](https://discord.com/channels/{interaction.guild_id}/{game['channel_id']}/{key}))"
+        for key, game in sorted(games.items(), key=lambda item: int(item[0]))
+        if "queue" in game and game["phase"] in labels
+    ]
+    # Embeds can hold 4096 characters, which is about 40 queues at this length.
+    embed = discord.Embed(
+        title="🎮 Queues",
+        description="\n".join(lines[-40:]) or "No queues right now. Run `/queue open` to make one.",
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @app_commands.command(name="customgame", description="(Admins only) Start a custom game")
@@ -827,7 +893,7 @@ async def resetleaderboard_command(interaction: discord.Interaction, board: Lite
 
 
 COMMANDS = (
-    queue_command,
+    queue_group,
     customgame_command,
     leaderboard_command,
     addpoints_command,

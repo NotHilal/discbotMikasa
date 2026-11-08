@@ -61,7 +61,7 @@ Anyone can run `/leaderboard` to see the top 20, ranked by wins. Each server has
 
 ### Queues
 
-An admin runs `/queue`, and players react with ✅ to join. The queue closes at 10 players, and a new one is opened with `/queue` again. Admins then split the 10 players into two teams of 5 and click **Confirm teams**, which starts the map vote.
+An admin runs `/queue open`, and players react with ✅ to join. The queue closes at 10 players, and a new one is opened with `/queue open` again. `/queue list` shows every queue in the server, and `/queue start` closes this channel's newest open queue early (with at least 2 players), which is useful for testing without 10 people. Admins then split the 10 players into two teams of 5 and click **Confirm teams**, which starts the map vote.
 
 If a player removes their reaction or an admin kicks them with the dropdown before the teams are confirmed, the queue reopens for a replacement. Once the teams are confirmed, an admin has to cancel the game to change them.
 
