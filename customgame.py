@@ -303,6 +303,62 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
     return embed, view
 
 
+BALLOT_BUTTON_ID = "mikasa:game:ballot"
+
+
+def render_public(game: dict) -> tuple[discord.Embed, discord.ui.View]:
+    """What players see: the game's progress, with no admin controls."""
+    embed, view = render(game)
+    for item in list(view.children):
+        if item.custom_id != BALLOT_BUTTON_ID:
+            view.remove_item(item)
+    if game["phase"] == "teams":
+        embed = discord.Embed(
+            title=f"🎮 Custom Game Queue ({len(game['queue'])}/{QUEUE_SIZE})",
+            description="The queue is closed. Admins are picking the teams.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Players", value="\n".join(f"<@{user_id}>" for user_id in game["queue"]), inline=False)
+    # Permission warnings are for the admins.
+    for index, field in reversed(list(enumerate(embed.fields))):
+        if field.value.startswith("⚠️"):
+            embed.remove_field(index)
+    return embed, view
+
+
+def render_admin(game: dict) -> tuple[discord.Embed, discord.ui.View]:
+    """The control panel: every admin control, without the players' Vote button."""
+    embed, view = render(game)
+    for item in list(view.children):
+        if item.custom_id == BALLOT_BUTTON_ID:
+            view.remove_item(item)
+    return embed, view
+
+
+def _render_for(game: dict, message_id: int) -> tuple[discord.Embed, discord.ui.View]:
+    if "panel_id" not in game:
+        return render(game)  # a game from before panels, on a single message
+    return render_admin(game) if game["panel_id"] == message_id else render_public(game)
+
+
+def _find_game(games: dict, message_id: int) -> tuple[str | None, dict | None]:
+    """Finds a game from either its public message or its admin panel."""
+    key = str(message_id)
+    if key in games:
+        return key, games[key]
+    for key, game in games.items():
+        if game.get("panel_id") == message_id:
+            return key, game
+    return None, None
+
+
+async def _show_update(interaction: discord.Interaction, key: str, game: dict) -> None:
+    """Updates the clicked message through the interaction, then the game's other message."""
+    embed, view = _render_for(game, interaction.message.id)
+    await interaction.response.edit_message(embed=embed, view=view)
+    await _update_game_message(interaction.client, key, game, skip=interaction.message.id)
+
+
 async def _deny(interaction: discord.Interaction, message: str) -> None:
     await interaction.response.send_message(message, ephemeral=True)
 
@@ -314,7 +370,7 @@ async def _set_team(interaction: discord.Interaction, team: str, chosen: list[in
 
     store = interaction.client.store
     games = store.get(interaction.guild_id).get("games", {})
-    game = games.get(str(interaction.message.id))
+    key, game = _find_game(games, interaction.message.id)
     if game is None or game["phase"] != "teams":
         await _deny(interaction, "❌ The teams for this game can't be changed anymore.")
         return
@@ -327,16 +383,14 @@ async def _set_team(interaction: discord.Interaction, team: str, chosen: list[in
     game[f"team_{other}"] = [user_id for user_id in game[f"team_{other}"] if user_id not in chosen]
     game[f"team_{team}"] = chosen
     store.update(interaction.guild_id, games=games)
-    embed, view = render(game)
-    await interaction.response.edit_message(embed=embed, view=view)
+    await _show_update(interaction, key, game)
 
 
 async def handle_button(interaction: discord.Interaction, action: str, arg: str | None) -> None:
     store = interaction.client.store
     settings = store.get(interaction.guild_id)
     games = settings.get("games", {})
-    key = str(interaction.message.id)
-    game = games.get(key)
+    key, game = _find_game(games, interaction.message.id)
 
     if game is None:
         await _deny(interaction, "❌ This game no longer exists.")
@@ -346,8 +400,7 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         return
     if game["phase"] not in ACTION_PHASES[action]:
         # An old click or a message that missed an update: just show the current step.
-        embed, view = render(game)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await _show_update(interaction, key, game)
         return
 
     leaderboard = settings.get("leaderboard", {})
@@ -386,13 +439,19 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         store.update(interaction.guild_id, games=games)
         embed = _base_embed("🚫 Custom game cancelled", game, discord.Color.dark_grey())
         await interaction.response.edit_message(embed=embed, view=None)
+        await _edit_game_messages(
+            interaction.client,
+            key,
+            game,
+            lambda _renderer: (embed, None),
+            skip=interaction.message.id,
+        )
         await _delete_team_calls(interaction.client, game.get("call_ids", []))
         return
 
     # Saved together, so a game and its leaderboard change can't get out of step.
     store.update(interaction.guild_id, games=games, leaderboard=leaderboard)
-    embed, view = render(game)
-    await interaction.response.edit_message(embed=embed, view=view)
+    await _show_update(interaction, key, game)
     await _delete_team_calls(interaction.client, calls_to_delete)
     if game["phase"] == "playing":
         await open_team_calls(interaction.client, interaction.guild_id, key, game)
@@ -407,7 +466,7 @@ async def handle_kick(interaction: discord.Interaction, user_id: int) -> None:
 
     store = interaction.client.store
     games = store.get(interaction.guild_id).get("games", {})
-    game = games.get(str(interaction.message.id))
+    key, game = _find_game(games, interaction.message.id)
     if game is None or game["phase"] not in ("queue", "teams"):
         await _deny(interaction, "❌ This queue has already closed.")
         return
@@ -417,10 +476,10 @@ async def handle_kick(interaction: discord.Interaction, user_id: int) -> None:
     game.setdefault("kicked", []).append(user_id)
 
     store.update(interaction.guild_id, games=games)
-    embed, view = render(game)
-    await interaction.response.edit_message(embed=embed, view=view)
+    await _show_update(interaction, key, game)
+    message = interaction.client.get_partial_messageable(game["channel_id"]).get_partial_message(int(key))
     try:
-        await interaction.message.remove_reaction(QUEUE_EMOJI, discord.Object(id=user_id))
+        await message.remove_reaction(QUEUE_EMOJI, discord.Object(id=user_id))
     except discord.HTTPException:
         log.warning("Couldn't remove the queue reaction of %s; the bot needs Manage Messages", user_id)
 
@@ -514,14 +573,24 @@ async def _delete_team_calls(client: discord.Client, channel_ids: list[int], kno
             log.exception("Couldn't delete team call %s", channel.id)
 
 
-async def _update_game_message(client: discord.Client, game_id: str, game: dict) -> None:
-    embed, view = render(game)
-    message = client.get_partial_messageable(game["channel_id"]).get_partial_message(int(game_id))
-    # The game is already saved, and clicking the old message refreshes it.
-    try:
-        await message.edit(embed=embed, view=view)
-    except discord.HTTPException:
-        log.exception("Couldn't update the custom game message %s", game_id)
+async def _edit_game_messages(client: discord.Client, game_id: str, game: dict, content, skip: int | None = None) -> None:
+    """Edits the public message and, if the game has one, the admin panel."""
+    targets = [(game["channel_id"], int(game_id), render_public if "panel_id" in game else render)]
+    if "panel_id" in game:
+        targets.append((game["panel_channel_id"], game["panel_id"], render_admin))
+    for channel_id, message_id, renderer in targets:
+        if message_id == skip:
+            continue
+        embed, view = content(renderer)
+        # The game is already saved, and clicking the old message refreshes it.
+        try:
+            await client.get_partial_messageable(channel_id).get_partial_message(message_id).edit(embed=embed, view=view)
+        except discord.HTTPException:
+            log.exception("Couldn't update the custom game message %s", message_id)
+
+
+async def _update_game_message(client: discord.Client, game_id: str, game: dict, skip: int | None = None) -> None:
+    await _edit_game_messages(client, game_id, game, lambda renderer: renderer(game), skip=skip)
 
 
 def render_ballot(game: dict, game_id: str, user_id: int) -> tuple[str, discord.ui.View]:
@@ -704,16 +773,47 @@ queue_group = app_commands.Group(
 )
 
 
-@queue_group.command(name="open", description="Open a 10-player custom game queue in this channel")
-async def queue_open(interaction: discord.Interaction):
+@queue_group.command(name="open", description="Open a queue: controls appear here, players see it in the chosen channel")
+@app_commands.describe(channel="The channel where players see and join the queue")
+async def queue_open(interaction: discord.Interaction, channel: discord.TextChannel):
     if not is_admin(interaction):
         await _deny(interaction, "❌ Only admins can open a queue.")
         return
+    permissions = channel.permissions_for(interaction.guild.me)
+    if not (
+        permissions.view_channel
+        and permissions.send_messages
+        and permissions.embed_links
+        and permissions.add_reactions
+        and permissions.read_message_history
+    ):
+        await _deny(
+            interaction,
+            f"❌ I can't run a queue in {channel.mention}. I need View Channel, Send Messages, "
+            "Embed Links, Add Reactions and Read Message History there.",
+        )
+        return
 
-    game = {"phase": "queue", "queue": [], "team_a": [], "team_b": [], "channel_id": interaction.channel_id}
-    embed, view = render(game)
+    game = {
+        "phase": "queue",
+        "queue": [],
+        "team_a": [],
+        "team_b": [],
+        "channel_id": channel.id,
+        "panel_channel_id": interaction.channel_id,
+    }
+    embed, view = render_admin(game)
     await interaction.response.send_message(embed=embed, view=view)
-    message = await interaction.original_response()
+    panel = await interaction.original_response()
+    game["panel_id"] = panel.id
+
+    embed, view = render_public(game)
+    try:
+        message = await channel.send(embed=embed, view=view)
+    except discord.HTTPException:
+        log.exception("Couldn't post the queue in %s", channel)
+        await panel.edit(content=f"❌ I couldn't post the queue in {channel.mention}.", embed=None, view=None)
+        return
 
     store = interaction.client.store
     games = store.get(interaction.guild_id).get("games", {})
@@ -722,11 +822,9 @@ async def queue_open(interaction: discord.Interaction):
     try:
         await message.add_reaction(QUEUE_EMOJI)
     except discord.HTTPException:
-        log.warning("Couldn't add the queue reaction in %s", interaction.guild)
+        log.warning("Couldn't add the queue reaction in %s", channel)
         await interaction.followup.send(
-            f"⚠️ I couldn't add the {QUEUE_EMOJI} reaction. Players can still add it themselves, "
-            "but I need Add Reactions and Read Message History.",
-            ephemeral=True,
+            f"⚠️ I couldn't add the {QUEUE_EMOJI} reaction in {channel.mention}. Players can still add it themselves."
         )
 
 
@@ -741,10 +839,12 @@ async def queue_start(interaction: discord.Interaction):
     open_here = [
         int(key)
         for key, game in games.items()
-        if game["phase"] == "queue" and "queue" in game and game["channel_id"] == interaction.channel_id
+        if game["phase"] == "queue"
+        and "queue" in game
+        and interaction.channel_id in (game["channel_id"], game.get("panel_channel_id"))
     ]
     if not open_here:
-        await _deny(interaction, "❌ There's no open queue in this channel. Run `/queue open` first.")
+        await _deny(interaction, "❌ There's no open queue for this channel. Run `/queue open` first.")
         return
     key = str(max(open_here))
     game = games[key]
@@ -782,34 +882,39 @@ async def queue_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+VALORANT_RED = 0xFF4655
+VALORANT_OFFWHITE = 0xECE8E1
+RANK_MEDALS = ("🥇", "🥈", "🥉")
+LEADERBOARD_FOOTER = f"VALORANT Custom Games • Top {LEADERBOARD_SIZE}"
+
+
+def _rank_label(rank: int) -> str:
+    return RANK_MEDALS[rank - 1] if rank <= len(RANK_MEDALS) else f"`#{rank:02d}`"
+
+
+def _themed_board(title: str, lines: list[str], empty: str, color: int) -> discord.Embed:
+    embed = discord.Embed(title=title, description="\n".join(lines) or empty, color=color)
+    embed.set_footer(text=LEADERBOARD_FOOTER)
+    return embed
+
+
 def build_leaderboard(leaderboard: dict) -> discord.Embed:
     ranked = sorted(leaderboard.items(), key=lambda item: (-item[1]["wins"], item[1]["losses"]))
-
-    def plural(count: int, word: str) -> str:
-        return f"{count} {word}" if count == 1 else f"{count} {word}{'es' if word == 'loss' else 's'}"
-
-    lines = [
-        f"{rank}. <@{user_id}>: {plural(entry['wins'], 'win')}, {plural(entry['losses'], 'loss')}"
-        for rank, (user_id, entry) in enumerate(ranked[:LEADERBOARD_SIZE], start=1)
-    ]
-    return discord.Embed(
-        title="🏆 Leaderboard",
-        description="\n".join(lines) or "No games have been played yet.",
-        color=discord.Color.gold(),
-    )
+    lines = []
+    for rank, (user_id, entry) in enumerate(ranked[:LEADERBOARD_SIZE], start=1):
+        wins, losses = entry["wins"], entry["losses"]
+        win_rate = round(wins * 100 / (wins + losses))
+        lines.append(f"{_rank_label(rank)} <@{user_id}> • **{wins}W** - {losses}L • {win_rate}% WR")
+    return _themed_board("🔺 VALORANT CUSTOMS // WINS", lines, "No games have been played yet.", VALORANT_RED)
 
 
 def build_points_leaderboard(points: dict) -> discord.Embed:
     ranked = sorted(points.items(), key=lambda item: -item[1])
     lines = [
-        f"{rank}. <@{user_id}>: {amount:,} GP"
+        f"{_rank_label(rank)} <@{user_id}> • **{amount:,} GP**"
         for rank, (user_id, amount) in enumerate(ranked[:LEADERBOARD_SIZE], start=1)
     ]
-    return discord.Embed(
-        title="🏆 Game Points Leaderboard",
-        description="\n".join(lines) or "Nobody has any Game Points yet.",
-        color=discord.Color.gold(),
-    )
+    return _themed_board("🔺 VALORANT CUSTOMS // GAME POINTS", lines, "Nobody has any Game Points yet.", VALORANT_OFFWHITE)
 
 
 @app_commands.command(name="leaderboard", description="Show this server's custom game wins or Game Points")

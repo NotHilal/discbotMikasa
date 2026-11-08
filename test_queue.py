@@ -95,17 +95,13 @@ class ReactionTests(QueueCase):
 class KickTests(QueueCase):
     async def test_admin_kicks_a_player_and_their_reaction_goes(self):
         self.save_queue([1, 2])
-        interaction = self.interaction()
-        interaction.message.remove_reaction = AsyncMock()
-        await customgame.handle_kick(interaction, 1)
+        await customgame.handle_kick(self.interaction(), 1)
         self.assertEqual(self.game()["queue"], [2])
-        interaction.message.remove_reaction.assert_awaited_once()
+        self.partial.remove_reaction.assert_awaited_once()
 
     async def test_kicked_player_cannot_rejoin_that_queue(self):
         self.save_queue([1, 2])
-        interaction = self.interaction()
-        interaction.message.remove_reaction = AsyncMock()
-        await customgame.handle_kick(interaction, 1)
+        await customgame.handle_kick(self.interaction(), 1)
         await self.react(1)
         self.assertEqual(self.game()["queue"], [2])
         self.assertEqual(self.partial.remove_reaction.await_args.args[1].id, 1)
@@ -123,9 +119,7 @@ class KickTests(QueueCase):
 
     async def test_kicking_from_a_full_queue_reopens_it(self):
         self.save_queue(range(1, 11), phase="teams")
-        interaction = self.interaction()
-        interaction.message.remove_reaction = AsyncMock()
-        await customgame.handle_kick(interaction, 3)
+        await customgame.handle_kick(self.interaction(), 3)
         self.assertEqual(self.game()["phase"], "queue")
 
     async def test_non_admin_cannot_kick(self):
@@ -143,11 +137,8 @@ class KickTests(QueueCase):
 
     async def test_failed_reaction_removal_still_kicks(self):
         self.save_queue([1])
-        interaction = self.interaction()
-        interaction.message.remove_reaction = AsyncMock(
-            side_effect=discord.Forbidden(MagicMock(status=403, reason="no"), "no")
-        )
-        await customgame.handle_kick(interaction, 1)
+        self.partial.remove_reaction.side_effect = discord.Forbidden(MagicMock(status=403, reason="no"), "no")
+        await customgame.handle_kick(self.interaction(), 1)
         self.assertEqual(self.game()["queue"], [])
 
 
@@ -268,6 +259,11 @@ class QueueCommandTests(QueueCase):
         await customgame.queue_start.callback(interaction)
         self.assertIn("no open queue", self.denial(interaction))
 
+    async def test_start_works_from_the_admin_channel(self):
+        self.save_queue([1, 2], channel_id=55, panel_channel_id=77, panel_id=600)
+        await customgame.queue_start.callback(self.interaction())
+        self.assertEqual(self.game()["phase"], "teams")
+
     async def test_start_picks_the_newest_queue(self):
         older = {"phase": "queue", "queue": [1, 2], "team_a": [], "team_b": [], "channel_id": 77}
         newer = {**older, "queue": [3, 4]}
@@ -316,6 +312,137 @@ class QueueCommandTests(QueueCase):
         self.assertIn("No queues", self.reply(interaction))
 
 
+class AdminPanelTests(QueueCase):
+    PANEL_ID = 600
+
+    def panel_game(self, **fields):
+        self.save_queue(channel_id=55, panel_channel_id=77, panel_id=self.PANEL_ID, **fields)
+
+    def panel_click(self, **kwargs):
+        interaction = self.interaction(**kwargs)
+        interaction.message.id = self.PANEL_ID
+        return interaction
+
+    def ids(self, view):
+        return [item.custom_id for item in view.children]
+
+    def games_at_every_phase(self):
+        base = {"team_a": [1], "team_b": [2], "queue": [1, 2], "channel_id": 55, "panel_id": 600, "panel_channel_id": 77}
+        maps = {"maps": ["A", "B", "C"], "votes": {}, "vote_ends_at": 1000}
+        return [
+            {**base, "phase": "queue"},
+            {**base, "phase": "teams"},
+            {**base, "phase": "vote", **maps},
+            {**base, "phase": "playing", "map": "A", **maps},
+            {**base, "phase": "finished", "map": "A", "winner": "a", **maps},
+        ]
+
+    async def test_public_message_never_has_admin_controls(self):
+        expected = [[], [], ["mikasa:game:ballot"], [], []]
+        for game, wanted in zip(self.games_at_every_phase(), expected):
+            _, view = customgame.render_public(game)
+            self.assertEqual(self.ids(view), wanted, game["phase"])
+
+    async def test_panel_has_the_admin_controls_but_no_vote_button(self):
+        for game in self.games_at_every_phase():
+            _, view = customgame.render_admin(game)
+            self.assertNotIn("mikasa:game:ballot", self.ids(view))
+            self.assertTrue(self.ids(view), game["phase"])
+
+    async def test_public_message_hides_partial_teams_while_picking(self):
+        game = self.games_at_every_phase()[1]
+        embed, _ = customgame.render_public(game)
+        self.assertIn("Admins are picking", embed.description)
+        self.assertNotIn("Team 1", [field.name for field in embed.fields])
+
+    async def test_public_message_hides_permission_warnings(self):
+        game = {**self.games_at_every_phase()[3], "calls_failed": True}
+        embed, _ = customgame.render_public(game)
+        self.assertNotIn("Team calls", [field.name for field in embed.fields])
+        embed, _ = customgame.render_admin(game)
+        self.assertIn("Team calls", [field.name for field in embed.fields])
+
+    async def test_reacting_on_the_public_message_updates_both(self):
+        self.panel_game()
+        await self.react(1)
+        self.assertEqual(self.game()["queue"], [1])
+        self.assertEqual(self.partial.edit.await_count, 2)
+        channels = [call.args[0] for call in self.client.get_partial_messageable.call_args_list]
+        self.assertIn(55, channels)
+        self.assertIn(77, channels)
+
+    async def test_panel_click_finds_the_game_and_updates_the_public_message(self):
+        self.panel_game(team_a=[1], team_b=[2], started_early=True, phase="teams")
+        interaction = self.panel_click()
+        await customgame.handle_button(interaction, "start", None)
+        self.assertEqual(self.game()["phase"], "vote")
+        self.assertNotIn("mikasa:game:ballot", self.ids(interaction.response.edit_message.await_args.kwargs["view"]))
+        self.assertEqual(self.partial.edit.await_count, 1)
+        self.assertIn("mikasa:game:ballot", self.ids(self.partial.edit.await_args.kwargs["view"]))
+
+    async def test_kick_from_the_panel_removes_the_public_reaction(self):
+        self.panel_game()
+        self.store.update(self.GUILD_ID, games={str(self.MESSAGE_ID): {**self.game(), "queue": [1, 2]}})
+        await customgame.handle_kick(self.panel_click(), 1)
+        self.assertEqual(self.game()["queue"], [2])
+        self.client.get_partial_messageable.return_value.get_partial_message.assert_called_with(self.MESSAGE_ID)
+        self.partial.remove_reaction.assert_awaited_once()
+
+    async def test_team_pick_from_the_panel(self):
+        self.panel_game(phase="teams", started_early=True)
+        self.store.update(self.GUILD_ID, games={str(self.MESSAGE_ID): {**self.game(), "queue": [1, 2]}})
+        await customgame._set_team(self.panel_click(), "a", [1])
+        self.assertEqual(self.game()["team_a"], [1])
+
+    async def test_cancel_from_the_panel_clears_both_messages(self):
+        self.panel_game()
+        interaction = self.panel_click()
+        await customgame.handle_button(interaction, "cancel", None)
+        self.assertIsNone(self.game())
+        self.assertIsNone(self.partial.edit.await_args.kwargs["view"])
+        self.assertIn("cancelled", self.partial.edit.await_args.kwargs["embed"].title)
+
+    async def test_players_cannot_use_the_panel(self):
+        self.panel_game(team_a=[1], team_b=[2], started_early=True, phase="teams")
+        interaction = self.panel_click(admin=False)
+        await customgame.handle_button(interaction, "start", None)
+        self.assertIn("admins", self.denial(interaction))
+
+    async def test_open_posts_the_panel_here_and_the_queue_in_the_chosen_channel(self):
+        public = MagicMock(id=self.MESSAGE_ID, add_reaction=AsyncMock())
+        channel = MagicMock(id=55, send=AsyncMock(return_value=public))
+        interaction = self.interaction()
+        interaction.original_response = AsyncMock(return_value=MagicMock(id=self.PANEL_ID))
+        await customgame.queue_open.callback(interaction, channel)
+        game = self.game()
+        self.assertEqual(game["channel_id"], 55)
+        self.assertEqual(game["panel_channel_id"], 77)
+        self.assertEqual(game["panel_id"], self.PANEL_ID)
+        public.add_reaction.assert_awaited_once_with(customgame.QUEUE_EMOJI)
+        self.assertEqual(channel.send.await_args.kwargs["view"].children, [])
+        self.assertIn("mikasa:queuekick" if game["queue"] else "mikasa:game:cancel", self.ids(
+            interaction.response.send_message.await_args.kwargs["view"]
+        ))
+
+    async def test_open_refuses_a_channel_it_cannot_use(self):
+        channel = MagicMock(id=55, mention="<#55>", send=AsyncMock())
+        channel.permissions_for.return_value.add_reactions = False
+        interaction = self.interaction()
+        await customgame.queue_open.callback(interaction, channel)
+        self.assertIn("can't run a queue", self.denial(interaction))
+        channel.send.assert_not_awaited()
+
+    async def test_only_admins_open(self):
+        interaction = self.interaction(admin=False)
+        await customgame.queue_open.callback(interaction, MagicMock())
+        self.assertIn("admins", self.denial(interaction))
+
+    async def test_old_single_message_games_keep_their_buttons(self):
+        game = {"phase": "playing", "map": "A", "team_a": [1], "team_b": [2], "channel_id": 77}
+        _, view = customgame._render_for(game, self.MESSAGE_ID)
+        self.assertIn("mikasa:game:won:a", self.ids(view))
+
+
 class ScoreboardTests(CustomGameCase):
     def setUp(self):
         super().setUp()
@@ -339,7 +466,7 @@ class ScoreboardTests(CustomGameCase):
         await self.refresh()
         self.client.get_partial_messageable.assert_called_once_with(88)
         titles = [embed.title for embed in self.channel.send.await_args.kwargs["embeds"]]
-        self.assertEqual(titles, ["🏆 Leaderboard", "🏆 Game Points Leaderboard"])
+        self.assertEqual(titles, ["🔺 VALORANT CUSTOMS // WINS", "🔺 VALORANT CUSTOMS // GAME POINTS"])
         self.assertEqual(self.store.get(self.GUILD_ID)["scoreboard_message_id"], 321)
 
     async def test_later_updates_edit_the_same_message(self):
@@ -385,7 +512,7 @@ class ScoreboardTests(CustomGameCase):
         self.configure(scoreboard_message_id=321)
         self.save_game(phase="playing", map="Bind", maps=["Bind"], votes={}, channel_id=77)
         await customgame.handle_button(self.interaction(), "won", "a")
-        self.assertIn("1 win", self.edit.await_args.kwargs["embeds"][0].description)
+        self.assertIn("**1W**", self.edit.await_args.kwargs["embeds"][0].description)
         await customgame.handle_button(self.interaction(), "undo", None)
         self.assertIn("No games", self.edit.await_args.kwargs["embeds"][0].description)
 
@@ -520,7 +647,7 @@ class PointsTests(CustomGameCase):
         interaction = self.interaction()
         await customgame.leaderboard_command.callback(interaction, "game points")
         text = interaction.response.send_message.await_args.kwargs["embed"].description
-        self.assertEqual(text.split("\n"), ["1. <@2>: 1,500 GP", "2. <@1>: 10 GP"])
+        self.assertEqual(text.split("\n"), ["🥇 <@2> • **1,500 GP**", "🥈 <@1> • **10 GP**"])
         interaction = self.interaction()
         await customgame.leaderboard_command.callback(interaction)
         self.assertIn("<@3>", interaction.response.send_message.await_args.kwargs["embed"].description)

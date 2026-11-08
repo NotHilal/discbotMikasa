@@ -51,7 +51,7 @@ Settings, games in progress and leaderboards are saved in `data.json`. Back it u
 
 ## Custom games
 
-An admin (anyone with Manage Server) runs `/queue open`, and one message then moves through each step:
+An admin (anyone with Manage Server) runs `/queue open`, and the game then moves through each step:
 
 1. **Teams:** the admin picks up to 5 players per team from the dropdowns. Each team needs at least one player. Picking someone already on the other team moves them.
 2. **Map vote:** players click **Vote**, pick up to 2 maps on a private ballot and click **Confirm vote**. Picks that aren't confirmed don't count, and a player can vote again to change their choice. The totals stay hidden until voting ends, which happens after 2 minutes, when everyone has confirmed, or when an admin clicks **End vote**. Ties are picked at random.
@@ -62,7 +62,7 @@ Anyone can run `/leaderboard` to see the top 20, ranked by wins. Each server has
 
 ### Queues
 
-An admin runs `/queue open`, and players react with ✅ to join. The queue closes at 10 players, and a new one is opened with `/queue open` again. `/queue list` shows every queue in the server, and `/queue start` closes this channel's newest open queue early (with at least 2 players), which is useful for testing without 10 people. Admins then split the 10 players into two teams of 5 from dropdowns that only list the queued players, and click **Confirm teams**, which starts the map vote.
+An admin runs `/queue open channel:#your-channel` from an admin channel. The controls appear there, and the chosen channel shows players only what they need: the queue, the Vote button and the results. Players react with ✅ on that message to join. The queue closes at 10 players, and a new one is opened with `/queue open` again. `/queue list` shows every queue in the server, and `/queue start` closes this channel's newest open queue early (with at least 2 players), which is useful for testing without 10 people. Admins then split the 10 players into two teams of 5 from dropdowns that only list the queued players, and click **Confirm teams**, which starts the map vote.
 
 If a player removes their reaction or an admin kicks them with the dropdown before the teams are confirmed, the queue reopens for a replacement. A kicked player can't rejoin that queue, but can join the next one. Once the teams are confirmed, an admin has to cancel the game to change them.
 

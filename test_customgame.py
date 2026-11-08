@@ -43,6 +43,7 @@ class CustomGameCase(unittest.IsolatedAsyncioTestCase):
             "started_early": True,
             "team_a": [1, 2],
             "team_b": [3, 4],
+            "channel_id": 77,
             **fields,
         }
         self.store.update(self.GUILD_ID, games={str(self.MESSAGE_ID): game})
@@ -92,8 +93,22 @@ class HelperTests(unittest.TestCase):
         ).description
         self.assertEqual(
             text.split("\n"),
-            ["1. <@2>: 3 wins, 1 loss", "2. <@3>: 1 win, 0 losses", "3. <@1>: 1 win, 5 losses"],
+            [
+                "🥇 <@2> • **3W** - 1L • 75% WR",
+                "🥈 <@3> • **1W** - 0L • 100% WR",
+                "🥉 <@1> • **1W** - 5L • 17% WR",
+            ],
         )
+
+    def test_places_after_third_use_a_numbered_tag(self):
+        board = {str(i): {"wins": 10 - i, "losses": 0} for i in range(5)}
+        lines = customgame.build_leaderboard(board).description.split("\n")
+        self.assertTrue(lines[3].startswith("`#04` "))
+
+    def test_leaderboards_use_the_valorant_theme(self):
+        embed = customgame.build_leaderboard({})
+        self.assertEqual(embed.color.value, customgame.VALORANT_RED)
+        self.assertIn("VALORANT", embed.footer.text)
 
     def test_empty_leaderboard(self):
         self.assertIn("No games", customgame.build_leaderboard({}).description)
