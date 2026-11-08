@@ -127,6 +127,7 @@ def remove_from_queue(game: dict, user_id: int) -> bool:
     game["queue"].remove(user_id)
     game["team_a"] = [member for member in game["team_a"] if member != user_id]
     game["team_b"] = [member for member in game["team_b"] if member != user_id]
+    game.get("names", {}).pop(str(user_id), None)
     game["phase"] = "queue"
     game.pop("started_early", None)
     return True
@@ -191,13 +192,40 @@ def _team_select(game: dict, team: str, row: int) -> "TeamSelect":
     )
 
 
-def _kick_select(row: int) -> "KickSelect":
+def _queue_options(game: dict, selected: list[int] = ()) -> list[discord.SelectOption]:
+    """One dropdown option per queued player, so nobody else can be picked."""
+    names = game.get("names", {})
+    return [
+        discord.SelectOption(
+            label=names.get(str(user_id), f"Player {user_id}")[:100],
+            value=str(user_id),
+            default=user_id in selected,
+        )
+        for user_id in game["queue"]
+    ]
+
+
+def _queue_team_select(game: dict, team: str, row: int) -> "QueueTeamSelect":
+    return QueueTeamSelect(
+        discord.ui.Select(
+            custom_id=f"mikasa:queueteam:{team}",
+            placeholder=f"Pick {TEAM_NAMES[team]}",
+            min_values=0,
+            max_values=min(MAX_TEAM_SIZE, len(game["queue"])),
+            options=_queue_options(game, game[f"team_{team}"]),
+            row=row,
+        )
+    )
+
+
+def _kick_select(game: dict, row: int) -> "KickSelect":
     return KickSelect(
-        discord.ui.UserSelect(
-            custom_id="mikasa:kick",
+        discord.ui.Select(
+            custom_id="mikasa:queuekick",
             placeholder="Admins: kick a player from the queue",
             min_values=1,
             max_values=1,
+            options=_queue_options(game),
             row=row,
         )
     )
@@ -217,14 +245,16 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
         embed.add_field(
             name="Players", value="\n".join(f"<@{user_id}>" for user_id in game["queue"]) or "Nobody yet", inline=False
         )
-        view.add_item(_kick_select(0))
+        if game["queue"]:  # Discord refuses a dropdown with no options
+            view.add_item(_kick_select(game, 0))
         view.add_item(_button("cancel", "Cancel", discord.ButtonStyle.secondary, row=1))
 
     elif phase == "teams":
         embed = _base_embed("🎮 Custom Game: pick the teams", game, discord.Color.blurple())
-        view.add_item(_team_select(game, "a", 0))
-        view.add_item(_team_select(game, "b", 1))
         queued = "queue" in game
+        make_select = _queue_team_select if queued else _team_select
+        view.add_item(make_select(game, "a", 0))
+        view.add_item(make_select(game, "b", 1))
         if queued:
             unassigned = [user_id for user_id in game["queue"] if user_id not in players(game)]
             if game.get("started_early"):
@@ -235,7 +265,7 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
                 embed.add_field(
                     name="Not on a team yet", value=" ".join(f"<@{user_id}>" for user_id in unassigned), inline=False
                 )
-            view.add_item(_kick_select(2))
+            view.add_item(_kick_select(game, 2))
         row = 3 if queued else 2
         label = "Confirm teams" if queued else "Start map vote"
         view.add_item(_button("start", label, discord.ButtonStyle.success, disabled=not teams_ready(game), row=row))
@@ -292,6 +322,10 @@ async def _deny(interaction: discord.Interaction, message: str) -> None:
 
 
 async def handle_team_select(interaction: discord.Interaction, team: str, selected: list) -> None:
+    await _set_team(interaction, team, [user.id for user in selected if not user.bot])
+
+
+async def _set_team(interaction: discord.Interaction, team: str, chosen: list[int]) -> None:
     if not is_admin(interaction):
         await _deny(interaction, "❌ Only admins can set the teams.")
         return
@@ -303,7 +337,6 @@ async def handle_team_select(interaction: discord.Interaction, team: str, select
         await _deny(interaction, "❌ The teams for this game can't be changed anymore.")
         return
 
-    chosen = [user.id for user in selected if not user.bot]
     if "queue" in game and any(user_id not in game["queue"] for user_id in chosen):
         await _deny(interaction, "❌ Only players in the queue can be put on a team.")
         return
@@ -383,7 +416,7 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         await open_team_calls(interaction.client, interaction.guild_id, key, game)
 
 
-async def handle_kick(interaction: discord.Interaction, selected: list) -> None:
+async def handle_kick(interaction: discord.Interaction, user_id: int) -> None:
     if not is_admin(interaction):
         await _deny(interaction, "❌ Only admins can kick players from the queue.")
         return
@@ -394,8 +427,7 @@ async def handle_kick(interaction: discord.Interaction, selected: list) -> None:
     if game is None or game["phase"] not in ("queue", "teams"):
         await _deny(interaction, "❌ This queue has already closed.")
         return
-    user = selected[0]
-    if not remove_from_queue(game, user.id):
+    if not remove_from_queue(game, user_id):
         await _deny(interaction, "❌ That player isn't in the queue.")
         return
 
@@ -403,9 +435,9 @@ async def handle_kick(interaction: discord.Interaction, selected: list) -> None:
     embed, view = render(game)
     await interaction.response.edit_message(embed=embed, view=view)
     try:
-        await interaction.message.remove_reaction(QUEUE_EMOJI, user)
+        await interaction.message.remove_reaction(QUEUE_EMOJI, discord.Object(id=user_id))
     except discord.HTTPException:
-        log.warning("Couldn't remove the queue reaction of %s; the bot needs Manage Messages", user.id)
+        log.warning("Couldn't remove the queue reaction of %s; the bot needs Manage Messages", user_id)
 
 
 async def handle_queue_reaction(client: discord.Client, payload: discord.RawReactionActionEvent, adding: bool) -> None:
@@ -435,6 +467,8 @@ async def handle_queue_reaction(client: discord.Client, payload: discord.RawReac
         return
 
     game["queue"].append(payload.user_id)
+    if payload.member is not None:
+        game.setdefault("names", {})[str(payload.user_id)] = payload.member.display_name
     if len(game["queue"]) >= QUEUE_SIZE:
         game["phase"] = "teams"
     client.store.update(payload.guild_id, games=games)
@@ -665,16 +699,29 @@ class TeamSelect(discord.ui.DynamicItem[discord.ui.UserSelect], template=r"mikas
         await handle_team_select(interaction, self.team, self.item.values)
 
 
-class KickSelect(discord.ui.DynamicItem[discord.ui.UserSelect], template=r"mikasa:kick"):
+class KickSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"mikasa:queuekick"):
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
         return cls(item)
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await handle_kick(interaction, self.item.values)
+        await handle_kick(interaction, int(self.item.values[0]))
 
 
-DYNAMIC_ITEMS = (GameButton, TeamSelect, BallotSelect, ConfirmVote, KickSelect)
+class QueueTeamSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"mikasa:queueteam:(?P<team>[ab])"):
+    team: str
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        select = cls(item)
+        select.team = match["team"]
+        return select
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await _set_team(interaction, self.team, [int(value) for value in self.item.values])
+
+
+DYNAMIC_ITEMS = (GameButton, TeamSelect, BallotSelect, ConfirmVote, KickSelect, QueueTeamSelect)
 
 
 queue_group = app_commands.Group(

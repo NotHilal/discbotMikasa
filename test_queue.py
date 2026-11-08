@@ -10,7 +10,7 @@ from test_customgame import CustomGameCase, user
 def payload(user_id, message_id=500, emoji=customgame.QUEUE_EMOJI, is_bot=False, guild_id=1):
     event = MagicMock(user_id=user_id, message_id=message_id, guild_id=guild_id)
     event.emoji.__str__.return_value = emoji
-    event.member = MagicMock(bot=is_bot)
+    event.member = MagicMock(bot=is_bot, display_name=f"Name{user_id}")
     return event
 
 
@@ -96,7 +96,7 @@ class KickTests(QueueCase):
         self.save_queue([1, 2])
         interaction = self.interaction()
         interaction.message.remove_reaction = AsyncMock()
-        await customgame.handle_kick(interaction, [user(1)])
+        await customgame.handle_kick(interaction, 1)
         self.assertEqual(self.game()["queue"], [2])
         interaction.message.remove_reaction.assert_awaited_once()
 
@@ -104,20 +104,20 @@ class KickTests(QueueCase):
         self.save_queue(range(1, 11), phase="teams")
         interaction = self.interaction()
         interaction.message.remove_reaction = AsyncMock()
-        await customgame.handle_kick(interaction, [user(3)])
+        await customgame.handle_kick(interaction, 3)
         self.assertEqual(self.game()["phase"], "queue")
 
     async def test_non_admin_cannot_kick(self):
         self.save_queue([1])
         interaction = self.interaction(admin=False)
-        await customgame.handle_kick(interaction, [user(1)])
+        await customgame.handle_kick(interaction, 1)
         self.assertIn("admins", self.denial(interaction))
         self.assertEqual(self.game()["queue"], [1])
 
     async def test_kicking_someone_not_queued_is_refused(self):
         self.save_queue([1])
         interaction = self.interaction()
-        await customgame.handle_kick(interaction, [user(9)])
+        await customgame.handle_kick(interaction, 9)
         self.assertIn("isn't in the queue", self.denial(interaction))
 
     async def test_failed_reaction_removal_still_kicks(self):
@@ -126,13 +126,63 @@ class KickTests(QueueCase):
         interaction.message.remove_reaction = AsyncMock(
             side_effect=discord.Forbidden(MagicMock(status=403, reason="no"), "no")
         )
-        await customgame.handle_kick(interaction, [user(1)])
+        await customgame.handle_kick(interaction, 1)
         self.assertEqual(self.game()["queue"], [])
 
 
 class QueueTeamTests(QueueCase):
     def full(self, **fields):
         self.save_queue(range(1, 11), phase="teams", **fields)
+
+    def selects(self, game):
+        _, view = customgame.render(game)
+        return {item.custom_id: item for item in view.children if hasattr(item.item, "options")}
+
+    async def test_reacting_saves_the_players_name(self):
+        self.save_queue()
+        await self.react(1)
+        self.assertEqual(self.game()["names"], {"1": "Name1"})
+
+    async def test_team_dropdowns_only_offer_queued_players(self):
+        self.save_queue([1, 2, 3], phase="teams", started_early=True, names={"1": "Ann", "2": "Bo"}, team_a=[1])
+        selects = self.selects(self.game())
+        team = selects["mikasa:queueteam:a"].item
+        self.assertEqual([option.value for option in team.options], ["1", "2", "3"])
+        self.assertEqual([option.label for option in team.options], ["Ann", "Bo", "Player 3"])
+        self.assertEqual([option.default for option in team.options], [True, False, False])
+        self.assertEqual(team.max_values, 3)
+        self.assertEqual(team.min_values, 0)
+
+    async def test_full_queue_limits_each_team_to_five(self):
+        self.full()
+        self.assertEqual(self.selects(self.game())["mikasa:queueteam:b"].item.max_values, 5)
+
+    async def test_kick_dropdown_only_offers_queued_players(self):
+        self.save_queue([1, 2])
+        kick = self.selects(self.game())["mikasa:queuekick"].item
+        self.assertEqual([option.value for option in kick.options], ["1", "2"])
+
+    async def test_empty_queue_has_no_kick_dropdown(self):
+        self.save_queue()
+        self.assertEqual(self.selects(self.game()), {})
+
+    async def test_custom_ids_match_their_handlers(self):
+        self.full()
+        selects = self.selects(self.game())
+        for custom_id, item in selects.items():
+            self.assertIn(type(item), customgame.DYNAMIC_ITEMS)
+            self.assertIsNotNone(type(item).__discord_ui_compiled_template__.fullmatch(custom_id))
+
+    async def test_picking_from_the_dropdown_sets_the_team(self):
+        self.full()
+        await customgame._set_team(self.interaction(), "a", [1, 2])
+        self.assertEqual(self.game()["team_a"], [1, 2])
+
+    async def test_picking_someone_moves_them_between_teams(self):
+        self.full(team_a=[1])
+        await customgame._set_team(self.interaction(), "b", [1])
+        self.assertEqual(self.game()["team_a"], [])
+        self.assertEqual(self.game()["team_b"], [1])
 
     async def test_only_queued_players_can_be_picked(self):
         self.full()
