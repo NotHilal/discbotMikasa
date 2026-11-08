@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import random
 import time
+from typing import Literal
 
 import discord
 from discord import app_commands
@@ -39,12 +40,16 @@ LEADERBOARD_SIZE = 20
 VOTES_PER_PLAYER = 2
 VOTE_SECONDS = 2 * 60
 
-TEAM_NAMES = {"a": "Team A", "b": "Team B"}
+QUEUE_SIZE = 10
+QUEUE_EMOJI = "✅"
+MAX_POINTS = 1_000_000
+
+TEAM_NAMES = {"a": "Team 1", "b": "Team 2"}
 
 # Which phases each button is valid in, so stale or double clicks do nothing.
 ACTION_PHASES = {
     "start": {"teams"},
-    "cancel": {"teams", "vote", "playing"},
+    "cancel": {"queue", "teams", "vote", "playing"},
     "ballot": {"vote"},
     "endvote": {"vote"},
     "won": {"playing"},
@@ -115,6 +120,23 @@ def finish_vote(game: dict) -> None:
     game["phase"] = "playing"
 
 
+def remove_from_queue(game: dict, user_id: int) -> bool:
+    """Takes a player out of a queue, reopening it if it had filled up."""
+    if user_id not in game.get("queue", []):
+        return False
+    game["queue"].remove(user_id)
+    game["team_a"] = [member for member in game["team_a"] if member != user_id]
+    game["team_b"] = [member for member in game["team_b"] if member != user_id]
+    game["phase"] = "queue"
+    return True
+
+
+def teams_ready(game: dict) -> bool:
+    if "queue" in game:
+        return len(game["team_a"]) == MAX_TEAM_SIZE and len(game["team_b"]) == MAX_TEAM_SIZE
+    return bool(game["team_a"] and game["team_b"])
+
+
 def _team_text(game: dict, team: str) -> str:
     return "\n".join(f"<@{user_id}>" for user_id in game[f"team_{team}"]) or "No players yet"
 
@@ -164,18 +186,52 @@ def _team_select(game: dict, team: str, row: int) -> "TeamSelect":
     )
 
 
+def _kick_select(row: int) -> "KickSelect":
+    return KickSelect(
+        discord.ui.UserSelect(
+            custom_id="mikasa:kick",
+            placeholder="Admins: kick a player from the queue",
+            min_values=1,
+            max_values=1,
+            row=row,
+        )
+    )
+
+
 def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
     """The embed and components for the game's current phase."""
     view = discord.ui.View(timeout=None)
     phase = game["phase"]
 
-    if phase == "teams":
+    if phase == "queue":
+        embed = discord.Embed(
+            title=f"🎮 Custom Game Queue ({len(game['queue'])}/{QUEUE_SIZE})",
+            description=f"React with {QUEUE_EMOJI} to join, and remove your reaction to leave.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Players", value="\n".join(f"<@{user_id}>" for user_id in game["queue"]) or "Nobody yet", inline=False
+        )
+        view.add_item(_kick_select(0))
+        view.add_item(_button("cancel", "Cancel", discord.ButtonStyle.secondary, row=1))
+
+    elif phase == "teams":
         embed = _base_embed("🎮 Custom Game: pick the teams", game, discord.Color.blurple())
         view.add_item(_team_select(game, "a", 0))
         view.add_item(_team_select(game, "b", 1))
-        ready = bool(game["team_a"] and game["team_b"])
-        view.add_item(_button("start", "Start map vote", discord.ButtonStyle.success, disabled=not ready, row=2))
-        view.add_item(_button("cancel", "Cancel", discord.ButtonStyle.secondary, row=2))
+        queued = "queue" in game
+        if queued:
+            unassigned = [user_id for user_id in game["queue"] if user_id not in players(game)]
+            embed.description = f"The queue is full. Admins: put {MAX_TEAM_SIZE} players on each team, then confirm."
+            if unassigned:
+                embed.add_field(
+                    name="Not on a team yet", value=" ".join(f"<@{user_id}>" for user_id in unassigned), inline=False
+                )
+            view.add_item(_kick_select(2))
+        row = 3 if queued else 2
+        label = "Confirm teams" if queued else "Start map vote"
+        view.add_item(_button("start", label, discord.ButtonStyle.success, disabled=not teams_ready(game), row=row))
+        view.add_item(_button("cancel", "Cancel", discord.ButtonStyle.secondary, row=row))
 
     elif phase == "vote":
         votes = game["votes"]
@@ -200,8 +256,18 @@ def render(game: dict) -> tuple[discord.Embed, discord.ui.View]:
         if game.get("map_note"):
             embed.description = game["map_note"]
         _add_vote_results(embed, game)
-        view.add_item(_button("won", "Team A won", discord.ButtonStyle.success, arg="a"))
-        view.add_item(_button("won", "Team B won", discord.ButtonStyle.success, arg="b"))
+        if game.get("call_ids"):
+            embed.add_field(
+                name="Team calls",
+                value=" ".join(f"<#{channel_id}>" for channel_id in game["call_ids"]),
+                inline=False,
+            )
+        elif game.get("calls_failed"):
+            embed.add_field(
+                name="Team calls", value="⚠️ I couldn't create the calls. I need Manage Channels and Connect.", inline=False
+            )
+        view.add_item(_button("won", "Team 1 won", discord.ButtonStyle.success, arg="a"))
+        view.add_item(_button("won", "Team 2 won", discord.ButtonStyle.success, arg="b"))
         view.add_item(_button("cancel", "Cancel game", discord.ButtonStyle.secondary))
 
     else:  # finished
@@ -230,6 +296,9 @@ async def handle_team_select(interaction: discord.Interaction, team: str, select
         return
 
     chosen = [user.id for user in selected if not user.bot]
+    if "queue" in game and any(user_id not in game["queue"] for user_id in chosen):
+        await _deny(interaction, "❌ Only players in the queue can be put on a team.")
+        return
     other = "b" if team == "a" else "a"
     # Picking someone already on the other team moves them, so nobody is on both.
     game[f"team_{other}"] = [user_id for user_id in game[f"team_{other}"] if user_id not in chosen]
@@ -259,6 +328,7 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         return
 
     leaderboard = settings.get("leaderboard", {})
+    calls_to_delete: list[int] = []
 
     if action == "ballot":
         if interaction.user.id not in players(game):
@@ -268,8 +338,9 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         await interaction.response.send_message(text, view=view, ephemeral=True)
         return
     elif action == "start":
-        if not (game["team_a"] and game["team_b"]):
-            await _deny(interaction, "❌ Both teams need at least one player.")
+        if not teams_ready(game):
+            needed = f"exactly {MAX_TEAM_SIZE} players" if "queue" in game else "at least one player"
+            await _deny(interaction, f"❌ Both teams need {needed}.")
             return
         game["maps"] = settings.get("maps", DEFAULT_MAPS)
         game["votes"] = {}
@@ -282,6 +353,7 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         game["winner"] = arg
         game["phase"] = "finished"
         apply_result(leaderboard, game, 1)
+        calls_to_delete = game.pop("call_ids", [])
     elif action == "undo":
         apply_result(leaderboard, game, -1)
         del game["winner"]
@@ -291,12 +363,128 @@ async def handle_button(interaction: discord.Interaction, action: str, arg: str 
         store.update(interaction.guild_id, games=games)
         embed = _base_embed("🚫 Custom game cancelled", game, discord.Color.dark_grey())
         await interaction.response.edit_message(embed=embed, view=None)
+        await _delete_team_calls(interaction.client, game.get("call_ids", []))
         return
 
     # Saved together, so a game and its leaderboard change can't get out of step.
     store.update(interaction.guild_id, games=games, leaderboard=leaderboard)
     embed, view = render(game)
     await interaction.response.edit_message(embed=embed, view=view)
+    await _delete_team_calls(interaction.client, calls_to_delete)
+    if game["phase"] == "playing":
+        await open_team_calls(interaction.client, interaction.guild_id, key, game)
+
+
+async def handle_kick(interaction: discord.Interaction, selected: list) -> None:
+    if not is_admin(interaction):
+        await _deny(interaction, "❌ Only admins can kick players from the queue.")
+        return
+
+    store = interaction.client.store
+    games = store.get(interaction.guild_id).get("games", {})
+    game = games.get(str(interaction.message.id))
+    if game is None or game["phase"] not in ("queue", "teams"):
+        await _deny(interaction, "❌ This queue has already closed.")
+        return
+    user = selected[0]
+    if not remove_from_queue(game, user.id):
+        await _deny(interaction, "❌ That player isn't in the queue.")
+        return
+
+    store.update(interaction.guild_id, games=games)
+    embed, view = render(game)
+    await interaction.response.edit_message(embed=embed, view=view)
+    try:
+        await interaction.message.remove_reaction(QUEUE_EMOJI, user)
+    except discord.HTTPException:
+        log.warning("Couldn't remove the queue reaction of %s; the bot needs Manage Messages", user.id)
+
+
+async def handle_queue_reaction(client: discord.Client, payload: discord.RawReactionActionEvent, adding: bool) -> None:
+    if payload.guild_id is None or str(payload.emoji) != QUEUE_EMOJI or payload.user_id == client.user.id:
+        return
+    games = client.store.get(payload.guild_id).get("games", {})
+    key = str(payload.message_id)
+    game = games.get(key)
+    if game is None or "queue" not in game:
+        return
+
+    if not adding:
+        if game["phase"] in ("queue", "teams") and remove_from_queue(game, payload.user_id):
+            client.store.update(payload.guild_id, games=games)
+            await _update_game_message(client, key, game)
+        return
+
+    if payload.user_id in game["queue"] or (payload.member is not None and payload.member.bot):
+        return
+    if game["phase"] != "queue":
+        # Closed, so this reaction didn't get them in. Don't leave it looking like it did.
+        message = client.get_partial_messageable(game["channel_id"]).get_partial_message(payload.message_id)
+        try:
+            await message.remove_reaction(QUEUE_EMOJI, discord.Object(id=payload.user_id))
+        except discord.HTTPException:
+            log.warning("Couldn't remove a late queue reaction; the bot needs Manage Messages")
+        return
+
+    game["queue"].append(payload.user_id)
+    if len(game["queue"]) >= QUEUE_SIZE:
+        game["phase"] = "teams"
+    client.store.update(payload.guild_id, games=games)
+    await _update_game_message(client, key, game)
+
+
+async def open_team_calls(client: discord.Client, guild_id: int, game_id: str, game: dict) -> None:
+    """Creates a voice channel per team that only that team's players can join."""
+    guild = client.get_guild(guild_id)
+    if guild is None or game.get("call_ids"):
+        return
+
+    channel = guild.get_channel(game["channel_id"])
+    created = []
+    failed = False
+    try:
+        for team in ("a", "b"):
+            overwrites = {guild.default_role: discord.PermissionOverwrite(connect=False)}
+            for user_id in game[f"team_{team}"]:
+                overwrites[discord.Object(id=user_id)] = discord.PermissionOverwrite(view_channel=True, connect=True)
+            created.append(
+                await guild.create_voice_channel(
+                    f"{TEAM_NAMES[team]} Call",
+                    overwrites=overwrites,
+                    category=getattr(channel, "category", None),
+                    reason="Custom game team call",
+                )
+            )
+    except discord.HTTPException:
+        log.exception("Couldn't create the team calls in %s", guild)
+        failed = True
+
+    # Fresh copy: the game may have changed or been cancelled while creating them.
+    games = client.store.get(guild_id).get("games", {})
+    current = games.get(game_id)
+    if failed or current is None or current["phase"] != "playing":
+        await _delete_team_calls(client, [call.id for call in created], created)
+        if failed and current is not None:
+            current["calls_failed"] = True
+            client.store.update(guild_id, games=games)
+            await _update_game_message(client, game_id, current)
+        return
+
+    current.pop("calls_failed", None)
+    current["call_ids"] = [call.id for call in created]
+    client.store.update(guild_id, games=games)
+    await _update_game_message(client, game_id, current)
+
+
+async def _delete_team_calls(client: discord.Client, channel_ids: list[int], known: list | None = None) -> None:
+    channels = known if known is not None else [client.get_channel(channel_id) for channel_id in channel_ids]
+    for channel in channels:
+        if channel is None:
+            continue  # already deleted by someone
+        try:
+            await channel.delete(reason="Custom game finished")
+        except discord.HTTPException:
+            log.exception("Couldn't delete team call %s", channel.id)
 
 
 async def _update_game_message(client: discord.Client, game_id: str, game: dict) -> None:
@@ -392,6 +580,8 @@ async def handle_confirm_vote(interaction: discord.Interaction, game_id: str) ->
         message += " Click **Vote** again to change it before voting ends."
     await interaction.response.edit_message(content=message, view=None)
     await _update_game_message(interaction.client, game_id, game)
+    if game["phase"] == "playing":
+        await open_team_calls(interaction.client, interaction.guild_id, game_id, game)
 
 
 async def expire_votes(client: discord.Client, now: float) -> None:
@@ -410,6 +600,7 @@ async def expire_votes(client: discord.Client, now: float) -> None:
 
         for key, game in expired:
             await _update_game_message(client, key, game)
+            await open_team_calls(client, guild.id, key, game)
 
 
 class GameButton(discord.ui.DynamicItem[discord.ui.Button], template=r"mikasa:game:(?P<action>[a-z]+)(?::(?P<arg>[a-z0-9]+))?"):
@@ -466,6 +657,46 @@ class TeamSelect(discord.ui.DynamicItem[discord.ui.UserSelect], template=r"mikas
         await handle_team_select(interaction, self.team, self.item.values)
 
 
+class KickSelect(discord.ui.DynamicItem[discord.ui.UserSelect], template=r"mikasa:kick"):
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(item)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await handle_kick(interaction, self.item.values)
+
+
+DYNAMIC_ITEMS = (GameButton, TeamSelect, BallotSelect, ConfirmVote, KickSelect)
+
+
+@app_commands.command(name="queue", description="(Admins only) Open a 10-player custom game queue")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def queue_command(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await _deny(interaction, "❌ Only admins can open a queue.")
+        return
+
+    game = {"phase": "queue", "queue": [], "team_a": [], "team_b": [], "channel_id": interaction.channel_id}
+    embed, view = render(game)
+    await interaction.response.send_message(embed=embed, view=view)
+    message = await interaction.original_response()
+
+    store = interaction.client.store
+    games = store.get(interaction.guild_id).get("games", {})
+    games[str(message.id)] = game
+    store.update(interaction.guild_id, games=games)
+    try:
+        await message.add_reaction(QUEUE_EMOJI)
+    except discord.HTTPException:
+        log.warning("Couldn't add the queue reaction in %s", interaction.guild)
+        await interaction.followup.send(
+            f"⚠️ I couldn't add the {QUEUE_EMOJI} reaction. Players can still add it themselves, "
+            "but I need Add Reactions and Read Message History.",
+            ephemeral=True,
+        )
+
+
 @app_commands.command(name="customgame", description="(Admins only) Start a custom game")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
@@ -502,8 +733,105 @@ def build_leaderboard(leaderboard: dict) -> discord.Embed:
     )
 
 
-@app_commands.command(name="leaderboard", description="Show who has the most custom game wins in this server")
+def build_points_leaderboard(points: dict) -> discord.Embed:
+    ranked = sorted(points.items(), key=lambda item: -item[1])
+    lines = [
+        f"{rank}. <@{user_id}>: {amount:,} GP"
+        for rank, (user_id, amount) in enumerate(ranked[:LEADERBOARD_SIZE], start=1)
+    ]
+    return discord.Embed(
+        title="🏆 Game Points Leaderboard",
+        description="\n".join(lines) or "Nobody has any Game Points yet.",
+        color=discord.Color.gold(),
+    )
+
+
+@app_commands.command(name="leaderboard", description="Show this server's custom game wins or Game Points")
 @app_commands.guild_only()
-async def leaderboard_command(interaction: discord.Interaction):
-    leaderboard = interaction.client.store.get(interaction.guild_id).get("leaderboard", {})
-    await interaction.response.send_message(embed=build_leaderboard(leaderboard))
+async def leaderboard_command(interaction: discord.Interaction, board: Literal["wins", "game points"] = "wins"):
+    settings = interaction.client.store.get(interaction.guild_id)
+    if board == "wins":
+        embed = build_leaderboard(settings.get("leaderboard", {}))
+    else:
+        embed = build_points_leaderboard(settings.get("points", {}))
+    await interaction.response.send_message(embed=embed)
+
+
+async def _change_points(interaction: discord.Interaction, player: discord.Member, change) -> None:
+    if not is_admin(interaction):
+        await _deny(interaction, "❌ Only admins can change Game Points.")
+        return
+    store = interaction.client.store
+    points = store.get(interaction.guild_id).get("points", {})
+    total = min(MAX_POINTS, max(0, change(points.get(str(player.id), 0))))
+    if total:
+        points[str(player.id)] = total
+    else:
+        points.pop(str(player.id), None)
+    store.update(interaction.guild_id, points=points)
+    await interaction.response.send_message(
+        f"✅ {player.mention} now has **{total:,} GP**.", allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+Amount = app_commands.Range[int, 1, MAX_POINTS]
+
+
+@app_commands.command(name="addpoints", description="(Admins only) Add Game Points to a player")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def addpoints_command(interaction: discord.Interaction, player: discord.Member, amount: Amount):
+    await _change_points(interaction, player, lambda current: current + amount)
+
+
+@app_commands.command(name="removepoints", description="(Admins only) Remove Game Points from a player")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def removepoints_command(interaction: discord.Interaction, player: discord.Member, amount: Amount):
+    await _change_points(interaction, player, lambda current: current - amount)
+
+
+@app_commands.command(name="setpoints", description="(Admins only) Set a player's total Game Points")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def setpoints_command(
+    interaction: discord.Interaction, player: discord.Member, amount: app_commands.Range[int, 0, MAX_POINTS]
+):
+    await _change_points(interaction, player, lambda current: amount)
+
+
+class ConfirmReset(discord.ui.View):
+    def __init__(self, board: str):
+        super().__init__(timeout=60)
+        self.board = board
+
+    @discord.ui.button(label="Yes, reset it", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        key = "leaderboard" if self.board == "wins" else "points"
+        interaction.client.store.update(interaction.guild_id, **{key: None})
+        await interaction.response.edit_message(content=f"✅ The **{self.board}** leaderboard has been reset.", view=None)
+
+
+@app_commands.command(name="resetleaderboard", description="(Admins only) Reset the wins or Game Points leaderboard")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def resetleaderboard_command(interaction: discord.Interaction, board: Literal["wins", "game points"]):
+    if not is_admin(interaction):
+        await _deny(interaction, "❌ Only admins can reset a leaderboard.")
+        return
+    await interaction.response.send_message(
+        f"⚠️ This permanently clears the **{board}** leaderboard for this server. Are you sure?",
+        view=ConfirmReset(board),
+        ephemeral=True,
+    )
+
+
+COMMANDS = (
+    queue_command,
+    customgame_command,
+    leaderboard_command,
+    addpoints_command,
+    removepoints_command,
+    setpoints_command,
+    resetleaderboard_command,
+)

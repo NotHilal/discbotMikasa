@@ -27,6 +27,7 @@ class CustomGameCase(unittest.IsolatedAsyncioTestCase):
         self.path = Path(tmp.name) / "data.json"
         self.store = storage.Store(self.path)
         self.client = MagicMock(store=self.store)
+        self.client.get_guild.return_value = None
 
     def interaction(self, user_id=100, admin=True):
         interaction = MagicMock(guild_id=self.GUILD_ID, client=self.client)
@@ -460,9 +461,7 @@ class RestartTests(CustomGameCase):
     async def click(self, game, custom_id, component_type, item_type, data=None, view=None, **interaction_args):
         client = bot.MikasaBot(self.store, "id", "secret")
         store = ViewStore(client._connection)
-        store.add_dynamic_items(
-            customgame.GameButton, customgame.TeamSelect, customgame.BallotSelect, customgame.ConfirmVote
-        )
+        store.add_dynamic_items(*customgame.DYNAMIC_ITEMS)
 
         if view is None:
             _, view = customgame.render(game)

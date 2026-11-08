@@ -59,6 +59,20 @@ An admin (anyone with Manage Server) runs `/customgame`, and one message then mo
 
 Anyone can run `/leaderboard` to see the top 20, ranked by wins. Each server has its own leaderboard, and games keep working if the bot restarts.
 
+### Queues
+
+An admin runs `/queue`, and players react with ✅ to join. The queue closes at 10 players, and a new one is opened with `/queue` again. Admins then split the 10 players into two teams of 5 and click **Confirm teams**, which starts the map vote.
+
+If a player removes their reaction or an admin kicks them with the dropdown before the teams are confirmed, the queue reopens for a replacement. Once the teams are confirmed, an admin has to cancel the game to change them.
+
+### Team calls
+
+When the map is announced, the bot creates **Team 1 Call** and **Team 2 Call** in the same category as the game, and only each team's players can join theirs. Both are deleted when an admin reports the winner or cancels the game. This needs the **Manage Channels** and **Connect** permissions, and the queue needs **Add Reactions**, **Read Message History** and **Manage Messages**.
+
+### Game Points
+
+`/leaderboard board:game points` ranks players by Game Points. Admins manage them with `/addpoints`, `/removepoints` and `/setpoints`, and `/resetleaderboard` clears either leaderboard after a confirmation.
+
 ## Role menus
 
 Admins (anyone with Manage Server) build a menu in the channel it should be posted in, then post it. A channel can hold several menus, each with its own name, like `age`, `ranks` or `notifs`.
